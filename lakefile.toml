@@ -1,0 +1,13 @@
+name = "sungrowd"
+version = "0.1.0"
+defaultTargets = ["sungrowd"]
+
+[[lean_lib]]
+name = "Modbus"
+
+[[lean_lib]]
+name = "Sungrowd"
+
+[[lean_exe]]
+name = "sungrowd"
+root = "Main"
