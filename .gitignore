@@ -1,0 +1,9 @@
+.lake/
+
+# environment vars
+.env
+.envrc
+
+sungrowd.db
+
+tmp/
