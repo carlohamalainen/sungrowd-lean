@@ -146,20 +146,21 @@ def Client.request (c : Client) (pdu : ByteArray) : M ByteArray := do
   ofExcept <| checkResponse pdu[0]! body
 
 def Client.readRegisters (c : Client) (fc : UInt8) (addr : UInt16) (n : Nat)
-  (_hn : 1 ≤ n ∧ n ≤ maxReadQuantity := by first | omega | decide) : M (Vector UInt16 n) := do
+  (_hn : ValidReadQuantity n := by first | omega | decide) : M (Vector UInt16 n) := do
   let body ← c.request <| readRequest fc addr n
   ofExcept <| parseReadResponse body n
 
 def Client.readHoldingRegisters (c : Client) (addr : UInt16) (n : Nat)
-      (_hn : 1 ≤ n ∧ n ≤ maxReadQuantity := by first | omega | decide) : M (Vector UInt16 n) := do
+      (_hn : ValidReadQuantity n := by first | omega | decide) : M (Vector UInt16 n) := do
   c.readRegisters fcReadHolding addr n
 
 def Client.readInputRegisters (c : Client) (addr : UInt16) (n : Nat)
-      (_hn : 1 ≤ n ∧ n ≤ maxReadQuantity := by first | omega | decide) : M (Vector UInt16 n) := do
+      (_hn : ValidReadQuantity n := by first | omega | decide) : M (Vector UInt16 n) := do
   c.readRegisters fcReadInput addr n
 
 def Client.writeMultipleRegisters (c : Client) (addr : UInt16) (vals : Vector UInt16 n)
-      (hn : 1 ≤ n ∧ n ≤ maxWriteQuantity := by first | omega | decide) : M Unit := do
+      (hn : ValidWriteQuantity n := by first | omega | decide) : M Unit := do
   let body ← c.request <| writeMultipleRequest addr vals
+  ofExcept (checkWriteEcho body addr vals.size)
 
 end Modbus

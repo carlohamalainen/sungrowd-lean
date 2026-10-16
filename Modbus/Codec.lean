@@ -50,6 +50,12 @@ abbrev maxReadQuantity  : Nat := 125
 so the byte count fits in a `UInt8`. -/
 abbrev maxWriteQuantity : Nat := 123
 
+/-- `n` is a legal register count for one FC3/FC4 read. -/
+abbrev ValidReadQuantity (n : Nat) : Prop := 1 ≤ n ∧ n ≤ maxReadQuantity
+
+/-- `n` is a legal register count for one FC16 write. -/
+abbrev ValidWriteQuantity (n : Nat) : Prop := 1 ≤ n ∧ n ≤ maxWriteQuantity
+
 structure Header where
   tx        : UInt16
   protocol  : UInt16
@@ -64,27 +70,29 @@ def Header.encode (h : Header) : ByteArray :=
     |> (putU16 · h.length)
     |> (.push  · h.unit)
 
-def Header.size : Nat := (⟨0, 0, 0, 0⟩ : Header).encode.size
+def Header.size : Nat := 7
 
 def Header.decode (b : ByteArray) : Option Header :=
   if b.size < Header.size then none
   else some { tx := getU16! b 0, protocol := getU16! b 2, length := getU16! b 4, unit := b[6]! }
 
-example : Header.size = 7 := by decide
+theorem Header.size_encode (h : Header) : h.encode.size = Header.size := by
+  simp [Header.encode, putU16]
+  decide
 
 def frame (tx : UInt16) (unit : UInt8) (pdu : ByteArray) : ByteArray :=
   let length := (pdu.size + 1).toUInt16
   (Header.encode { tx, protocol := 0, length := length, unit }) ++ pdu
 
 def readRequest (fc : UInt8) (addr : UInt16) (n : Nat)
-        (_hn : 1 ≤ n ∧ n ≤ maxReadQuantity := by first | omega | decide) : ByteArray :=
+        (_hn : ValidReadQuantity n := by first | omega | decide) : ByteArray :=
   ByteArray.empty
     |> (.push · fc)
     |> (putU16 · addr)
     |> (putU16 · n.toUInt16)
 
 def writeMultipleRequest (addr : UInt16) (vals : Vector UInt16 n)
-      (_h : 1 ≤ n ∧ n ≤ maxWriteQuantity := by first | omega | decide) : ByteArray :=
+      (_h : ValidWriteQuantity n := by first | omega | decide) : ByteArray :=
   let hdr := ByteArray.empty
         |> (.push · fcWriteMultiple)
         |> (putU16 · addr)
