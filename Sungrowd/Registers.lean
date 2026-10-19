@@ -1,5 +1,9 @@
 import Lean.Data.Json
 import Lean.Elab.Deriving.FromToJson
+import Std.Time
+import Std.Async
+
+import Modbus.Client
 
 /-! # Sungrow register definitions
 
@@ -14,12 +18,19 @@ Lean has no YAML parser (?) so I did a one off YAML to JSON conversion using
 namespace Sungrowd
 
 open Lean
+open Std.Time
+open Std.Async
 
 /-- Modbus has read-only "input" registers and writable "holding" registers. -/
 inductive InputType
   | input
   | holding
 deriving BEq, DecidableEq, Hashable, Repr
+
+instance : ToString InputType where
+  toString
+    | .input   => "input"
+    | .holding => "holding"
 
 instance : FromJson InputType where
   fromJson?
@@ -36,6 +47,14 @@ inductive DataType
   /-- ASCII packed two characters per register, `count` registers long. -/
   | string
   deriving BEq, DecidableEq, Repr
+
+instance : ToString DataType where
+  toString
+  | .int16  => "int16"
+  | .uint16 => "uint16"
+  | .int32  => "int32"
+  | .uint32 => "uint32"
+  | .string => "string"
 
 instance : FromJson DataType where
   fromJson?
@@ -96,12 +115,21 @@ structure Sensor where
   state_class         : Option String     := none
   deriving Repr, FromJson
 
+instance : ToString Sensor where
+  toString s := s!"<{s.name}> {s.unique_id} {s.address} {s.input_type} {s.data_type} "
+
 /-- Number of 16-bit registers one read of this sensor needs. -/
 def Sensor.words (s : Sensor) : Nat :=
   match s.data_type with
   | .int16  | .uint16 => 1
   | .int32  | .uint32 => 2
   | .string           => s.count.getD 1
+
+/-- First register of the sensor. A Sensor's registers are in the half-open range `[s.start, s.stop)`. -/
+def Sensor.start (s : Sensor) : Nat := s.address.toNat
+
+/-- One past the sensor's last register, so `[s.start, s.stop)` is half-open. -/
+def Sensor.stop  (s : Sensor) : Nat := s.start + s.words
 
 /-- One Modbus hub (there is exactly one in the file). -/
 structure Hub where
@@ -127,5 +155,130 @@ def Registers.load (path : System.FilePath) : IO Registers := do
 
 def Registers.byId (h : Hub) : Std.HashMap (InputType × String) Sensor :=
   h.sensors.foldl (init := {}) fun m s => m.insert ⟨s.input_type, s.unique_id⟩ s
+
+/-- One read of a sensor: its `n` registers, as they came off the wire. -/
+structure Reading (n : Nat) where
+  raw       : Vector UInt16 n
+  read_at   : Timestamp   -- for humans, UTC
+  read_mono : Nat         -- for liveness checks, IO.monoNanosNow
+deriving Repr
+
+structure Slot where
+  sensor    : Sensor
+  reading   : Option (Reading sensor.words) := none
+deriving Repr
+
+def Slot.sensors (slots : Array Slot) : List Sensor :=
+  slots.toList.map (·.sensor)
+
+structure ReadBlock where
+  input_type  : InputType
+  address     : Nat
+  nr_words    : Nat
+  slots       : Array Slot
+
+  fits        : Modbus.ValidReadQuantity nr_words
+  same_type   : ∀ s ∈ Slot.sensors slots, s.input_type = input_type
+  disjoint    : (Slot.sensors slots).Pairwise (·.stop ≤ ·.start)
+  inside      : ∀ s ∈ Slot.sensors slots,
+                  address ≤ s.start ∧ s.stop ≤ address + nr_words
+deriving Repr
+
+theorem Slot.sensors_set (a : Array Slot) (i : Nat) (hi : i < a.size) (x : Slot)
+    (hx : x.sensor = a[i].sensor) : Slot.sensors (a.set i x hi) = Slot.sensors a := by
+    unfold Slot.sensors
+    rw [Array.toList_set, List.map_set, hx]
+    apply List.ext_getElem
+    case hl => simp
+    case h =>
+      intro j h1 h2
+      simp [List.getElem_set]
+      intro i_eq_j
+      subst i_eq_j
+      rfl
+
+theorem Slot.sensors_setReading (a : Array Slot) (i : Nat) (hi : i < a.size)
+          (r : Option (Reading a[i].sensor.words)) :
+          Slot.sensors (a.set i { a[i] with reading := r } hi) = Slot.sensors a := by
+  let x : Slot := { a[i] with reading := r}
+  apply Slot.sensors_set a i hi x
+  rfl
+
+def ReadBlock.make? (ty : InputType) (addr n : Nat) (slots : Array Slot) : Option ReadBlock :=
+  if h : (Modbus.ValidReadQuantity n)
+       ∧ (∀ s ∈ Slot.sensors slots, s.input_type = ty)
+       ∧ (Slot.sensors slots).Pairwise (·.stop ≤ ·.start)
+       ∧ (∀ s ∈ Slot.sensors slots, addr ≤ s.start ∧ s.stop ≤ addr + n)
+    then
+      have ⟨fits, same_type, disjoint, inside⟩ := h
+      some ⟨ty, addr, n, slots, fits, same_type, disjoint, inside⟩
+    else
+      none
+
+def ReadBlock.setReading (b : ReadBlock) (i : Fin b.slots.size)
+    (r : Reading b.slots[i].sensor.words) : ReadBlock :=
+  { b with
+      slots := b.slots.set i { b.slots[i] with reading := some r }
+      fits        := b.fits
+      same_type   := Slot.sensors_setReading b.slots i i.isLt (some r) ▸ b.same_type
+      disjoint    := Slot.sensors_setReading b.slots i i.isLt (some r) ▸ b.disjoint
+      inside      := Slot.sensors_setReading b.slots i i.isLt (some r) ▸ b.inside
+  }
+
+/-- Rebuilding every slot from its own sensor leaves the sensor list unchanged. -/
+theorem Slot.sensors_ofFn (a : Array Slot)
+    (f : (i : Fin a.size) → Option (Reading a[i].sensor.words)) :
+    Slot.sensors (Array.ofFn fun i => { sensor := a[i].sensor, reading := f i })
+      = Slot.sensors a := by
+  unfold Slot.sensors
+  apply List.ext_getElem
+  case hl => simp
+  case h =>
+    intro j h1 h2
+    simp
+
+/-- Replace every slot's reading at once; `f i` is the new reading for slot `i`. -/
+def ReadBlock.setReadings (b : ReadBlock)
+    (f : (i : Fin b.slots.size) → Option (Reading b.slots[i].sensor.words)) : ReadBlock :=
+  { b with
+      slots       := Array.ofFn fun i => { sensor := b.slots[i].sensor, reading := f i }
+      same_type   := Slot.sensors_ofFn b.slots f ▸ b.same_type
+      disjoint    := Slot.sensors_ofFn b.slots f ▸ b.disjoint
+      inside      := Slot.sensors_ofFn b.slots f ▸ b.inside
+  }
+
+-- TODO mpr?
+theorem ReadBlock.mem_sensors (b : ReadBlock) (i : Fin b.slots.size) :
+    b.slots[i].sensor ∈ Slot.sensors b.slots :=
+  List.mem_map.mpr ⟨b.slots[i], Array.getElem_mem_toList i.isLt, rfl⟩
+
+-- given a ReadBlock and a raw vector of words read from the inverter, an index into the slots,
+-- we can extract the raw words for this sensor, specifically the correct number of words
+-- since i is dependent, amazing.
+def ReadBlock.slice (b : ReadBlock) (v : Vector UInt16 b.nr_words) (i : Fin b.slots.size) :
+    Vector UInt16 b.slots[i].sensor.words :=
+
+  let s      := b.slots[i].sensor
+  let offset := s.start - b.address
+
+  have hin : b.address ≤ s.start ∧ s.stop ≤ b.address + b.nr_words := b.inside s (b.mem_sensors i)
+
+  Vector.ofFn fun (k : Fin s.words) =>
+    v[offset + k]'(by
+      have hk : k.val < s.words := k.isLt
+      have hstop : s.stop = s.start + s.words := rfl
+      omega
+      )
+
+/-- Read the block's registers in one request and record a reading in every slot. -/
+def ReadBlock.read (b : ReadBlock) (c : Modbus.Client) : Modbus.M ReadBlock := do
+  let addr := b.address.toUInt16
+  let v ← match b.input_type with
+    | .input   => c.readInputRegisters   addr b.nr_words b.fits
+    | .holding => c.readHoldingRegisters addr b.nr_words b.fits
+  let readAt ← Timestamp.now
+  let readMono ← IO.monoNanosNow
+
+  return b.setReadings fun i => some ⟨b.slice v i, readAt, readMono⟩
 
 end Sungrowd

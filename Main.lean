@@ -27,12 +27,20 @@ inductive MetricKind
   | counter
   deriving Repr, BEq
 
+instance : ToString MetricKind where
+  toString
+    | .gauge   => "gauge"
+    | .counter => "counter"
+
 /-- One exported value: which sensor to read, and how to name and describe it. -/
 structure MetricDef where
   sensorId : String
   name     : String
   help     : String
   kind     : MetricKind
+
+instance : ToString MetricDef where
+  toString m := s!"{m.name} ({m.kind}, sensor {m.sensorId}): {m.help}"
 
 def metricDefs : Array MetricDef := #[
   -- Solar (instantaneous + per-string).
@@ -110,6 +118,28 @@ def scaled (s : Sensor) (raw : Int) : String :=
   | none        => toString raw
   | some ⟨m, e⟩ => withDecimals (raw * m) e
 
+/-- Decode a sensor's registers to its raw (unscaled) integer value. `none` when the
+inverter reports the sensor's `nan_value`, and for string sensors, which
+`resolveMetrics` rejects up front. -/
+def decodeRaw (s : Sensor) (r : Vector UInt16 s.words) : Option Int :=
+  let raw? : Option Int := match h : s.data_type with
+    | .int16  => some (s16 (r[0]'(by simp [Sensor.words, h])))
+    | .uint16 => some (r[0]'(by simp [Sensor.words, h])).toNat
+    | .int32  => some (u32 (r.cast (by simp [Sensor.words, h])) s.swap).toInt32.toInt
+    | .uint32 => some (u32 (r.cast (by simp [Sensor.words, h])) s.swap).toNat
+    | .string => none
+  raw?.filter (some · != s.nan_value)
+
+/-- A slot's reading as a scaled value with its unit, e.g. `"34.5 V"`. -/
+def Sungrowd.Slot.display (slot : Slot) : String :=
+  let s := slot.sensor
+  match slot.reading with
+  | none   => "not read"
+  | some r =>
+    match decodeRaw s r.raw with
+    | none     => "unavailable"
+    | some raw => s!"{scaled s raw} {s.unit_of_measurement.getD "(unitless)"}"
+
 /-! ## Reading -/
 
 /-- Read `n` registers at the sensor's address, from its address space.  -/
@@ -119,28 +149,22 @@ def readRegs (c : Client) (s : Sensor) (n : Nat)
   | .input   => c.readInputRegisters   s.address n hn
   | .holding => c.readHoldingRegisters s.address n hn
 
-/-- Read a sensor and decode it to its raw (unscaled) integer value.
-Returns `none` when the inverter reports the sensor's `nan_value` value. -/
-def readRaw (c : Client) (s : Sensor) : M (Option Int) := do
-  let raw : Int ← match s.data_type with
-    | .int16  => pure (s16  (← readRegs c s 1)[0])
-    | .uint16 => pure (     (← readRegs c s 1)[0].toNat : Int)
-    | .int32  => pure (u32  (← readRegs c s 2) s.swap).toInt32.toInt
-    | .uint32 => pure ((u32 (← readRegs c s 2) s.swap).toNat : Int)
-    | .string => throw (.protocol s!"{s.unique_id}: string sensors are not supported")
-  return if s.nan_value == some raw then none else some raw
-
-def readAll (host : String) (debug : Bool) (targets : Array (MetricDef × Sensor)) : M Unit := do
+/-- Connect once, read every block in one request each, and print one line per sensor.
+`names` maps a sensor's `unique_id` to the metric name to print. -/
+def readBlocks (host : String) (debug : Bool) (names : HashMap String String)
+    (blocks : Array ReadBlock) : M Unit := do
   let addr ← guardIO <| resolve host modbusPort
   let deadline := (← IO.monoMsNow) + timeoutMs
   let c ← connect addr unitId deadline debug
   try
-    let width := targets.foldl (init := 0) fun w (m, _) => max w m.name.length
-    for (m, s) in targets do
-      let value ← match ← readRaw c s with
-        | none     => pure "unavailable"
-        | some raw => pure s!"{scaled s raw} {s.unit_of_measurement.getD ""}"
-      IO.println s!"{m.name.pushn ' ' (width - m.name.length)}  {value}"
+    let name (s : Sensor) : String := names.getD s.unique_id s.unique_id
+    let width := blocks.foldl (init := 0) fun w b =>
+      b.slots.foldl (init := w) fun w slot => max w (name slot.sensor).length
+    for b in blocks do
+      let b ← b.read c
+      for slot in b.slots do
+        let n := name slot.sensor
+        IO.println s!"{n.pushn ' ' (width - n.length)}  {slot.display}"
   finally
     guardIO c.close
 
@@ -162,6 +186,39 @@ def resolveMetrics (byId : HashMap (InputType × String) Sensor) : Except String
     out := out.push (m, s)
   return out
 
+/-- The block that covers exactly `ss` from the first slot's start to the last slot's stop. -/
+def ReadBlock.ofSlots? (ss : Array Slot) : Option ReadBlock := do
+  let first ← ss[0]?
+  let last  ← ss.back?
+  let ty := first.sensor.input_type
+  let addr := first.sensor.start
+  ReadBlock.make? ty addr (last.sensor.stop - addr) ss
+
+def toBlocks (slots : Array Slot) : Except String (Array ReadBlock) := do
+  let mut blocks  : Array ReadBlock  := #[]
+  let mut current : Option ReadBlock := none
+
+  for s in slots do
+    -- If we have started to construct a ReadBlock, then try to
+    -- add `s` to it and continue:
+    if let some b := current then
+      if let some b' := ReadBlock.ofSlots? (b.slots.push s) then
+        current := some b'
+        continue
+
+      -- Couldn't add `s`, so this block is done.
+      blocks := blocks.push b
+
+    -- Can we get started with just `s`?
+    let some b := ReadBlock.ofSlots? #[s]
+          | throw s!"sensor {s.sensor.unique_id} does not fit in a read block"
+    current := some b
+
+  if let some b := current then
+    blocks := blocks.push b
+
+  return blocks
+
 def main : IO UInt32 := do
   let some host ← IO.getEnv hostEnvVar
     | IO.eprintln s!"error: {hostEnvVar} is not set (expected the inverter's IP or hostname)"
@@ -180,8 +237,21 @@ def main : IO UInt32 := do
       IO.eprintln s!"error: {registersPath}: {e}"
       return 2
 
-  match ← (readAll host debug targets).run.block with
-  | .ok () => return 0
+  let sensors := targets.map (·.2) |>.qsort (·.address < ·.address)
+
+  let slots : Array Slot := sensors.map fun s => Slot.mk s none
+
+  let blocks ← match toBlocks slots with
+    | .ok bs   => pure bs
+    | .error e =>
+      IO.eprintln s!"error: {e}"
+      return 2
+
+  let names : HashMap String String :=
+    targets.foldl (init := {}) fun m (d, s) => m.insert s.unique_id d.name
+
+  match ← (readBlocks host debug names blocks).run.block with
+  | .ok ()   => return 0
   | .error e =>
     IO.eprintln s!"error: {e}"
     return 1
