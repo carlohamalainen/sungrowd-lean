@@ -1,12 +1,17 @@
 import Modbus.Client
 import Sungrowd.Registers
+import Sungrowd.Control
+import Sungrowd.RunningState
+import Sungrowd.PowerFlow
 import Std.Data.HashMap
 
 open Std Async
 open Modbus
 open Sungrowd
+open Sungrowd.Control
 
-/-! Read a fixed set of Sungrow input registers from the inverter and print them.
+/-! Read a fixed set of Sungrow input registers from the inverter and print them,
+or read and write the EMS control registers (see `usage`).
 
 The register table is `reference/modbus_sungrow.json` (parsed by
 `Sungrowd/Registers.lean`). `metricDefs` below picks the sensors we care about
@@ -18,6 +23,8 @@ def hostEnvVar    : String := "SUNGROWD_WINET_HOST"
 def debugEnvVar   : String := "SUNGROWD_DEBUG"
 def registersPath : System.FilePath := "reference/modbus_sungrow.json"
 def modbusPort    : UInt16 := 502
+/-- Overrides `modbusPort`, e.g. to point at a fake inverter on localhost. -/
+def portEnvVar    : String := "SUNGROWD_WINET_PORT"
 def unitId        : UInt8  := 1
 /-- Deadline for connecting and reading every metric, one round trip each. -/
 def timeoutMs     : Nat    := 30000
@@ -83,7 +90,7 @@ def metricDefs : Array MetricDef := #[
   ⟨"sg_total_direct_energy_consumption", "solar_direct_consumption_kwh_total",    "PV-to-load directly lifetime total",            .counter⟩,
 
   -- State / mode.
-  ⟨"uid_sg_running_state_raw", "solar_running_state",     "Inverter running-state bitfield (raw)", .gauge⟩,
+  ⟨"uid_sg_running_state_raw", "solar_running_state",     "Inverter running state code (raw)",     .gauge⟩,
   ⟨"uid_power_flow_status",    "solar_power_flow_status", "Power-flow status bitfield (raw)",      .gauge⟩
 ]
 
@@ -130,7 +137,9 @@ def decodeRaw (s : Sensor) (r : Vector UInt16 s.words) : Option Int :=
     | .string => none
   raw?.filter (some · != s.nan_value)
 
-/-- A slot's reading as a scaled value with its unit, e.g. `"34.5 V"`. -/
+/-- A slot's reading as a scaled value with its unit, e.g. `"34.5 V"`. The running state
+is a code and the power flow status is a set of flags, so they get their labels from the YAML
+instead, e.g. `"2048 (Running in compulsory (forced) mode)"`. -/
 def Sungrowd.Slot.display (slot : Slot) : String :=
   let s := slot.sensor
   match slot.reading with
@@ -138,7 +147,13 @@ def Sungrowd.Slot.display (slot : Slot) : String :=
   | some r =>
     match decodeRaw s r.raw with
     | none     => "unavailable"
-    | some raw => s!"{scaled s raw} {s.unit_of_measurement.getD "(unitless)"}"
+    | some raw =>
+      if s.unique_id == "uid_sg_running_state_raw" then
+        s!"{raw} ({RunningState.labelRaw raw.toNat.toUInt16})"
+      else if s.unique_id == "uid_power_flow_status" then
+        PowerFlow.labelRaw raw.toNat.toUInt16
+      else
+        s!"{scaled s raw} {s.unit_of_measurement.getD "(unitless)"}"
 
 /-! ## Reading -/
 
@@ -151,9 +166,9 @@ def readRegs (c : Client) (s : Sensor) (n : Nat)
 
 /-- Connect once, read every block in one request each, and print one line per sensor.
 `names` maps a sensor's `unique_id` to the metric name to print. -/
-def readBlocks (host : String) (debug : Bool) (names : HashMap String String)
+def readBlocks (host : String) (port : UInt16) (debug : Bool) (names : HashMap String String)
     (blocks : Array ReadBlock) : M Unit := do
-  let addr ← guardIO <| resolve host modbusPort
+  let addr ← guardIO <| resolve host port
   let deadline := (← IO.monoMsNow) + timeoutMs
   let c ← connect addr unitId deadline debug
   try
@@ -219,12 +234,7 @@ def toBlocks (slots : Array Slot) : Except String (Array ReadBlock) := do
 
   return blocks
 
-def main : IO UInt32 := do
-  let some host ← IO.getEnv hostEnvVar
-    | IO.eprintln s!"error: {hostEnvVar} is not set (expected the inverter's IP or hostname)"
-      return 2
-  let debug := (← IO.getEnv debugEnvVar).isSome
-
+def readMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
   let registers ← Registers.load registersPath
 
   let some hub := registers.modbus[0]?
@@ -247,13 +257,95 @@ def main : IO UInt32 := do
       IO.eprintln s!"error: {e}"
       return 2
 
-  IO.println (repr blocks)
+  -- IO.println (repr blocks)
 
   let names : HashMap String String :=
     targets.foldl (init := {}) fun m (d, s) => m.insert s.unique_id d.name
 
-  match ← (readBlocks host debug names blocks).run.block with
+  match ← (readBlocks host port debug names blocks).run.block with
   | .ok ()   => return 0
   | .error e =>
     IO.eprintln s!"error: {e}"
     return 1
+
+/-! ## Control registers -/
+
+/-- `write` arguments to the registers they ask for. Power goes through `ofWatts?`, so it is
+snapped to 10 W and capped at the rating before anything is sent. -/
+def parseWrite : List String → Except String ControlRegisters
+  | ["self-consumption"] => pure .selfConsumption
+  | ["forced", "stop"]   => pure ⟨.forced, .stop, ⟨0, rfl, by decide⟩⟩
+  | ["forced", cmd, w]   => do
+    let command ← match cmd with
+      | "charge"    => pure Command.charge
+      | "discharge" => pure .discharge
+      | _           => throw s!"unknown command {cmd}"
+    let some watts := w.toNat? | throw s!"watts: expected a whole number, got {w}"
+    let some power := ForcedPower.ofWatts? watts
+      | throw s!"watts: {watts} is over the {maxForcedPowerW} W rating"
+    pure ⟨.forced, command, power⟩
+  | args => throw s!"cannot parse write arguments {args}"
+
+def usage : String := "usage:
+  sungrowd                                   read the sensors in metricDefs
+  sungrowd control                           read the EMS control registers
+  sungrowd write self-consumption [--dry-run]
+  sungrowd write forced stop [--dry-run]
+  sungrowd write forced charge|discharge <watts> [--dry-run]"
+
+def withClient (host : String) (port : UInt16) (debug : Bool) (k : Client → M α) : M α := do
+  let addr ← guardIO <| resolve host port
+  let c ← connect addr unitId ((← IO.monoMsNow) + timeoutMs) debug
+  try k c finally guardIO c.close
+
+def controlMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
+  match ← (withClient host port debug readControl).run.block with
+  | .ok v    =>
+    IO.println s!"{showRaw v}  raw {v.toArray}"
+    return 0
+  | .error e =>
+    IO.eprintln s!"error: {e}"
+    return 1
+
+/-- Exit 0 if the inverter now holds `value` (written or already there), 1 otherwise. -/
+def writeMain (host : String) (port : UInt16) (debug : Bool) (value : ControlRegisters) : IO UInt32 := do
+  let op? ← (withClient host port debug fun c => guardIO (safeWriteControl c value)).run.block
+  match op? with
+  | .error e =>
+    IO.eprintln s!"error: {e}"
+    return 1
+  | .ok op =>
+    IO.println (Lean.toJson op).pretty
+    return if op.outcome.err?.isNone then 0 else 1
+
+def main (args : List String) : IO UInt32 := do
+  let some host ← IO.getEnv hostEnvVar
+    | IO.eprintln s!"error: {hostEnvVar} is not set (expected the inverter's IP or hostname)"
+      return 2
+  let debug := (← IO.getEnv debugEnvVar).isSome
+  let port ← match ← IO.getEnv portEnvVar with
+    | none   => pure modbusPort
+    | some p => match p.toNat? with
+      | some n => if n < UInt16.size then pure n.toUInt16 else
+          IO.eprintln s!"error: {portEnvVar}={p} is out of range"; return 2
+      | none =>
+        IO.eprintln s!"error: {portEnvVar}={p} is not a number"; return 2
+
+  match args with
+  | []          => readMain host port debug
+  | ["control"] => controlMain host port debug
+  | "write" :: rest =>
+    let dryRun := rest.contains "--dry-run"
+    match parseWrite (rest.filter (· != "--dry-run")) with
+    | .error e =>
+      IO.eprintln s!"error: {e}\n{usage}"
+      return 2
+    | .ok value =>
+      if dryRun then
+        let pdu := writeMultipleRequest Sungrowd.Control.regEMSMode value.toRaw
+        IO.println s!"would write {value} to {Sungrowd.Control.regEMSMode}..: raw {value.toRaw.toArray}, PDU {hex pdu}"
+        return 0
+      writeMain host port debug value
+  | _ =>
+    IO.eprintln usage
+    return 2
