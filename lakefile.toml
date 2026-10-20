@@ -1,6 +1,6 @@
 name = "sungrowd"
 version = "0.1.0"
-defaultTargets = ["sungrowd"]
+defaultTargets = ["sungrowd", "Sungrowd"]
 
 [[lean_lib]]
 name = "Modbus"

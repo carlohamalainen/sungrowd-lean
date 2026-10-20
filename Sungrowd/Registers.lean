@@ -170,7 +170,7 @@ deriving Repr
 
 def Slot.sensors (slots : Array Slot) : List Sensor :=
   slots.toList.map (·.sensor)
-
+ 
 structure ReadBlock where
   input_type  : InputType
   address     : Nat

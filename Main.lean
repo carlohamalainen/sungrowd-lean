@@ -247,6 +247,8 @@ def main : IO UInt32 := do
       IO.eprintln s!"error: {e}"
       return 2
 
+  IO.println (repr blocks)
+
   let names : HashMap String String :=
     targets.foldl (init := {}) fun m (d, s) => m.insert s.unique_id d.name
 
