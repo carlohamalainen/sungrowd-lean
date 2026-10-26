@@ -41,7 +41,26 @@ Write the control registers.
 SUNGROWD_DEBUG=1 .lake/build/bin/sungrowd write forced charge 3000
 ```
 
+Run the control policy once (`Sungrowd/Policy.lean`): read the inverter, decide, and print
+what it would write. The file is either the Go daemon's `schedule.json` or its persisted intent
+(`{"charge_window": …, "manual_override": …}`).
+
+```
+# Dry run (the default): nothing is written.
+.lake/build/bin/sungrowd tick tmp/sungrowd-go/schedule.json
+
+# Keep the controller state between runs, so the SOC latch holds and the adaptive ramp continues:
+.lake/build/bin/sungrowd tick schedule.json --state state.json
+
+# Write the decision, if the inverter doesn't already hold it:
+.lake/build/bin/sungrowd tick schedule.json --state state.json --apply
+
+# The main fuse that bounds an adaptive ceiling (default 20 A):
+SUNGROWD_GRID_FUSE_A=20 .lake/build/bin/sungrowd tick schedule.json
+```
+
 # TODO
 
 Try <https://github.com/scidonia/leanin> 
 
+<https://github.com/paulbutcher/lean-telemetry>

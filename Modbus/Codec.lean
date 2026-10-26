@@ -6,6 +6,8 @@ inductive Error where
   | closed
   | protocol (msg : String)
   | io (msg : String)
+  /-- What we were doing when `cause` happened, e.g. "connecting to 192.168.1.5:502". -/
+  | context (what : String) (cause : Error)
   deriving Repr, BEq -- TODO , Inhabited
 
 def Error.toString : Error → String
@@ -14,6 +16,17 @@ def Error.toString : Error → String
   | .closed => "closed"
   | .protocol msg => s!"protocol error: {msg}"
   | .io msg => s!"io error: {msg}"
+  | .context what cause => s!"{what}: {cause.toString}"
+
+/-- The error underneath any `context`: what actually went wrong. Match on this, not on the error
+itself, when deciding what to do about a failure (e.g. retry on `.timeout`). -/
+def Error.root : Error → Error
+  | .context _ e => e.root
+  | e            => e
+
+#guard (Error.context "tick" (.context "reading 13049..13051" .timeout)).root == .timeout
+#guard (Error.context "tick" (.context "reading 13049..13051" .timeout)).toString
+  == "tick: reading 13049..13051: timeout"
 
 instance : ToString Error := ⟨Error.toString⟩
 

@@ -3,6 +3,7 @@ import Sungrowd.Registers
 import Sungrowd.Control
 import Sungrowd.RunningState
 import Sungrowd.PowerFlow
+import Sungrowd.Intent
 import Std.Data.HashMap
 
 open Std Async
@@ -28,6 +29,9 @@ def portEnvVar    : String := "SUNGROWD_WINET_PORT"
 def unitId        : UInt8  := 1
 /-- Deadline for connecting and reading every metric, one round trip each. -/
 def timeoutMs     : Nat    := 30000
+/-- The main fuse, which bounds an adaptive window's grid ceiling. Go's default is 20 A. -/
+def gridFuseEnvVar : String := "SUNGROWD_GRID_FUSE_A"
+def gridFuseAmpsDefault : Nat := 20
 
 inductive MetricKind
   | gauge
@@ -157,6 +161,11 @@ def Sungrowd.Slot.display (slot : Slot) : String :=
 
 /-! ## Reading -/
 
+/-- Like `ReadBlock.read`, but if the read fails, the error says which registers it was reading,
+e.g. `reading input registers 5213..5214: timeout` rather than just `timeout`. -/
+def Sungrowd.ReadBlock.readCtx (b : ReadBlock) (c : Client) : M ReadBlock :=
+  (b.read c).context s!"reading {b.input_type} registers {b.address}..{b.address + b.nr_words - 1}"
+
 /-- Read `n` registers at the sensor's address, from its address space.  -/
 def readRegs (c : Client) (s : Sensor) (n : Nat)
     (hn : ValidReadQuantity n := by first | omega | decide) : M (Vector UInt16 n) :=
@@ -164,24 +173,26 @@ def readRegs (c : Client) (s : Sensor) (n : Nat)
   | .input   => c.readInputRegisters   s.address n hn
   | .holding => c.readHoldingRegisters s.address n hn
 
+/-- Connect, run `k`, and close. Connection errors say where we were connecting to. -/
+def withClient (host : String) (port : UInt16) (debug : Bool) (k : Client → M α) : M α := do
+  let c ← M.context s!"connecting to {host}:{port} (from ${hostEnvVar})" do
+    let addr ← guardIO <| resolve host port
+    connect addr unitId ((← IO.monoMsNow) + timeoutMs) debug
+  try k c finally guardIO c.close
+
 /-- Connect once, read every block in one request each, and print one line per sensor.
 `names` maps a sensor's `unique_id` to the metric name to print. -/
 def readBlocks (host : String) (port : UInt16) (debug : Bool) (names : HashMap String String)
-    (blocks : Array ReadBlock) : M Unit := do
-  let addr ← guardIO <| resolve host port
-  let deadline := (← IO.monoMsNow) + timeoutMs
-  let c ← connect addr unitId deadline debug
-  try
+    (blocks : Array ReadBlock) : M Unit :=
+  withClient host port debug fun c => do
     let name (s : Sensor) : String := names.getD s.unique_id s.unique_id
     let width := blocks.foldl (init := 0) fun w b =>
       b.slots.foldl (init := w) fun w slot => max w (name slot.sensor).length
     for b in blocks do
-      let b ← b.read c
+      let b ← b.readCtx c
       for slot in b.slots do
         let n := name slot.sensor
         IO.println s!"{n.pushn ' ' (width - n.length)}  {slot.display}"
-  finally
-    guardIO c.close
 
 /-! ## Setup -/
 
@@ -234,18 +245,16 @@ def toBlocks (slots : Array Slot) : Except String (Array ReadBlock) := do
 
   return blocks
 
-def readMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
+/-- The read blocks covering `metricDefs`, and each sensor's metric name by `unique_id`. -/
+def loadBlocks : ExceptT String IO (Array ReadBlock × HashMap String String) := do
   let registers ← Registers.load registersPath
 
   let some hub := registers.modbus[0]?
-    | IO.eprintln s!"error: {registersPath}: no modbus hub"
-      return 2
+    | throw s!"{registersPath}: no modbus hub"
 
   let targets ← match resolveMetrics (Registers.byId hub) with
     | .ok t    => pure t
-    | .error e =>
-      IO.eprintln s!"error: {registersPath}: {e}"
-      return 2
+    | .error e => throw s!"{registersPath}: {e}"
 
   let sensors := targets.map (·.2) |>.qsort (·.address < ·.address)
 
@@ -253,14 +262,21 @@ def readMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
 
   let blocks ← match toBlocks slots with
     | .ok bs   => pure bs
-    | .error e =>
-      IO.eprintln s!"error: {e}"
-      return 2
+    | .error e => throw e
 
   -- IO.println (repr blocks)
 
   let names : HashMap String String :=
     targets.foldl (init := {}) fun m (d, s) => m.insert s.unique_id d.name
+
+  return (blocks, names)
+
+def readMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
+  let (blocks, names) ← match ← loadBlocks.run with
+    | .ok bn   => pure bn
+    | .error e =>
+      IO.eprintln s!"error: {e}"
+      return 2
 
   match ← (readBlocks host port debug names blocks).run.block with
   | .ok ()   => return 0
@@ -291,12 +307,9 @@ def usage : String := "usage:
   sungrowd control                           read the EMS control registers
   sungrowd write self-consumption [--dry-run]
   sungrowd write forced stop [--dry-run]
-  sungrowd write forced charge|discharge <watts> [--dry-run]"
-
-def withClient (host : String) (port : UInt16) (debug : Bool) (k : Client → M α) : M α := do
-  let addr ← guardIO <| resolve host port
-  let c ← connect addr unitId ((← IO.monoMsNow) + timeoutMs) debug
-  try k c finally guardIO c.close
+  sungrowd write forced charge|discharge <watts> [--dry-run]
+  sungrowd tick <intent.json> [--state <state.json>] [--apply]
+                                             decide once from a schedule or intent file"
 
 def controlMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
   match ← (withClient host port debug readControl).run.block with
@@ -317,6 +330,131 @@ def writeMain (host : String) (port : UInt16) (debug : Bool) (value : ControlReg
   | .ok op =>
     IO.println (Lean.toJson op).pretty
     return if op.outcome.err?.isNone then 0 else 1
+
+/-! ## One reconciliation: `tick` -/
+
+/-- Brisbane is UTC+10 all year (no daylight saving); Go uses `Australia/Brisbane`. -/
+def brisbaneOffsetS : Int := 10 * 3600
+
+/-- Minutes since local midnight. -/
+def brisbaneMinute (unix : Int) : Nat := ((unix + brisbaneOffsetS) % 86400 / 60).toNat
+
+/-- A sensor's raw (unscaled) value, from blocks that have been read. -/
+def rawById (blocks : Array ReadBlock) (id : String) : Option Int := do
+  let slot ← blocks.findSome? fun b => b.slots.find? (·.sensor.unique_id == id)
+  let r ← slot.reading
+  decodeRaw slot.sensor r.raw
+
+/-- The controller's inputs. The battery level's raw value is tenths of a percent (scale 0.1);
+both powers are whole watts (scale 1). These are the sensors Go's `handle` reads. -/
+def snapshotOf (blocks : Array ReadBlock) : Policy.Snapshot where
+  socTenths := (rawById blocks "sg_battery_level").map Int.toNat
+  gridW     := rawById blocks "sg_battery_export_power_raw"
+  batteryW  := rawById blocks "sg_battery_power"
+
+structure TickArgs where
+  intentPath : System.FilePath
+  statePath  : Option System.FilePath
+  apply      : Bool
+
+def parseTick (args : List String) : Except String TickArgs :=
+  go args none none false
+where
+  go : List String → Option String → Option String → Bool → Except String TickArgs
+    | [],                    some p, s,      a => pure ⟨p, s.map (·), a⟩
+    | [],                    none,   _,      _ => throw "tick: missing intent file"
+    | "--apply" :: rest,     p,      s,      _ => go rest p s true
+    | ["--state"],           _,      _,      _ => throw "tick: --state needs a file"
+    | "--state" :: f :: rest, p,     _,      a => go rest p (some f) a
+    | arg :: rest,           none,   s,      a =>
+      if arg.startsWith "--" then throw s!"tick: unknown option {arg}" else go rest (some arg) s a
+    | arg :: _,              some _, _,      _ => throw s!"tick: unexpected argument {arg}"
+
+def orThrow (what : String) : Except String α → ExceptT String IO α
+  | .ok a    => pure a
+  | .error e => throw s!"{what}: {e}"
+
+def readJsonFile (path : System.FilePath) : ExceptT String IO Lean.Json := do
+  orThrow path.toString (Lean.Json.parse (← IO.FS.readFile path))
+
+def envNat (var : String) (default : Nat) : ExceptT String IO Nat := do
+  match ← IO.getEnv var with
+  | none   => pure default
+  | some s => match s.toNat? with
+    | some n => pure n
+    | none   => throw s!"{var}={s} is not a whole number"
+
+def showOpt (o : Option α) (f : α → String) : String := (o.map f).getD "unavailable"
+
+def Sungrowd.Policy.Decision.show : Policy.Decision → String
+  | .apply r reason => s!"{reason.label}: {r}"
+  | .leave why      => s!"leave the inverter as it is: {why}"
+
+/-- Read the inverter, run `Policy.tick` once, and print what it decided. Writes only with
+`--apply`, and only if the inverter doesn't already hold the decision. With `--state`, the
+controller state is loaded before and saved after, so repeated ticks behave like the daemon. -/
+def tickMain (host : String) (port : UInt16) (debug : Bool) (args : TickArgs) : IO UInt32 := do
+  let setup : ExceptT String IO _ := do
+    let fuse   ← envNat gridFuseEnvVar gridFuseAmpsDefault
+    let intent ← orThrow args.intentPath.toString
+      (Policy.intentOfFile fuse (← readJsonFile args.intentPath))
+    let st : Policy.ControllerState ← match args.statePath with
+      | some p =>
+        if ← p.pathExists then orThrow p.toString (Policy.controllerStateOfJson fuse (← readJsonFile p))
+        else pure {}
+      | none => pure {}
+    let (blocks, _) ← loadBlocks
+    return (intent, st, blocks)
+  let (intent, st, blocks) ← match ← setup.run with
+    | .ok v    => pure v
+    | .error e =>
+      IO.eprintln s!"error: {e}"
+      return 2
+
+  let run : M UInt32 := withClient host port debug fun c => do
+    let current ← (readControl c).context
+      s!"reading the control registers {regEMSMode}..{regEMSMode + 2}"
+    -- Best effort, as in Go: an override or a disabled schedule doesn't need the sensors.
+    let blocks ← try blocks.mapM (·.readCtx c) catch e => do
+      IO.eprintln s!"warning: sensor read failed: {e}"
+      pure blocks
+    let snap    := snapshotOf blocks
+    let nowUnix := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
+    let minute  := brisbaneMinute nowUnix
+    let (intent', decision, st') := Policy.tick intent snap nowUnix minute st
+
+    let hhmm := (Policy.TimeOfDay.ofHM? (minute / 60) (minute % 60)).map toString |>.getD "?"
+    IO.println s!"now       {Policy.rfc3339OfUnix nowUnix} ({hhmm} Brisbane)"
+    IO.println s!"intent    {(Lean.toJson intent).compress}"
+    if intent' != intent then
+      IO.println s!"          override expired; {args.intentPath} is unchanged"
+    IO.println s!"soc       {showOpt snap.socTenths fun s => s!"{withDecimals s 1} %"}"
+    IO.println s!"grid      {showOpt snap.gridW fun w => s!"{w} W"} (+export/-import)"
+    IO.println s!"battery   {showOpt snap.batteryW fun w => s!"{w} W"} (+discharge/-charge)"
+    IO.println s!"inverter  {showRaw current}"
+    IO.println s!"decision  {decision.show}"
+    IO.println s!"state     {(Lean.toJson st').compress}"
+    if let some p := args.statePath then
+      IO.FS.writeFile p ((Lean.toJson st').pretty ++ "\n")
+
+    match decision with
+    | .leave _ => return 0
+    | .apply r _ =>
+      if current == r.toRaw then
+        IO.println "action    none: the inverter already holds it"
+        return 0
+      if !args.apply then
+        IO.println s!"action    would write {r} (pass --apply to write)"
+        return 0
+      let op ← guardIO (safeWriteControl c r)
+      IO.println (Lean.toJson op).pretty
+      return if op.outcome.err?.isNone then 0 else 1
+
+  match ← run.run.block with
+  | .ok code => return code
+  | .error e =>
+    IO.eprintln s!"error: {e}"
+    return 1
 
 def main (args : List String) : IO UInt32 := do
   let some host ← IO.getEnv hostEnvVar
@@ -346,6 +484,12 @@ def main (args : List String) : IO UInt32 := do
         IO.println s!"would write {value} to {Sungrowd.Control.regEMSMode}..: raw {value.toRaw.toArray}, PDU {hex pdu}"
         return 0
       writeMain host port debug value
+  | "tick" :: rest =>
+    match parseTick rest with
+    | .error e =>
+      IO.eprintln s!"error: {e}\n{usage}"
+      return 2
+    | .ok a => tickMain host port debug a
   | _ =>
     IO.eprintln usage
     return 2

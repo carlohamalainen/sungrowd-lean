@@ -15,6 +15,11 @@ def guardIO (x : Async α) : M α :=
   ExceptT.mk (try .ok <$> x
                catch e => pure (.error (.io e.toString)))
 
+/-- Run `x`, prefixing any error with what we were doing: `(readControl c).context "reading 13049"`
+fails with `reading 13049: timeout`. -/
+def M.context (what : String) (x : M α) : M α :=
+  ExceptT.adapt (Error.context what) x
+
 /-
 https://simplymodbus.ca/learn-tcp.html
 
