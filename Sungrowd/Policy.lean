@@ -117,22 +117,6 @@ structure Snapshot where
   batteryW  : Option Int
   deriving Repr
 
-/-- What the controller remembers between ticks. -/
-structure ControllerState where
-  /-- Have we reached the target SOC? -/
-  targetReached : Bool := false
-  /-- Adaptive controller's setpoint, at full resolution. -/
-  setpointW     : Int := 0
-  /-- Last quantized command, the position on the 100 W ladder (for hysteresis). -/
-  cmdW          : Int := 0
-  /-- The intent we last saw; a change resets the latch and soft-starts the controller. -/
-  lastIntent    : Option Intent := none
-  deriving Repr
-
-/-- Not actively adaptive-charging: the next entry into adaptive mode soft-starts from zero. -/
-def ControllerState.resetAdaptive (st : ControllerState) : ControllerState :=
-  { st with setpointW := 0, cmdW := 0 }
-
 /-! ## The adaptive controller -/
 
 def rampUpPerTickW : Int := 500  -- climb slowly: ~40 s from 0 to 4 kW
@@ -159,6 +143,70 @@ def hystQuantize (setpointW prevW : Int) : Int :=
     quantumW * (setpointW / quantumW)
   else
     prevW
+
+theorem adaptiveStep_nonneg (prevW ceilingW importW chargingW maxW : Int) (h : 0 ≤ maxW) :
+    0 ≤ adaptiveStep prevW ceilingW importW chargingW maxW := by
+  unfold adaptiveStep 
+  dsimp only
+  split <;> omega
+
+theorem adaptiveStep_le_max (prevW ceilingW importW chargingW maxW : Int) :
+    adaptiveStep prevW ceilingW importW chargingW maxW ≤ maxW := by
+  unfold adaptiveStep
+  dsimp only
+  split <;> omega
+
+/-! ## Commands the inverter echoes back
+
+The adaptive controller's command, `ControllerState.cmdW`, is what we send as the forced charge
+power. -/
+
+/-- A command the inverter will hold exactly: on the 100 W ladder (so also on the inverter's
+10 W grid) and within its rating. `ControllerState` carries a proof of this for its `cmdW`, so
+`chargeAt` needs no clamping. -/
+def CmdOk (w : Int) : Prop := w % 100 = 0 ∧ 0 ≤ w ∧ w ≤ maxForcedPowerW
+
+instance (w : Int) : Decidable (CmdOk w) := by unfold CmdOk; infer_instance
+
+theorem CmdOk.zero : CmdOk 0 := by decide
+
+/-- `adaptiveStep`, bounded by the inverter's rating, is a valid input to `hystQuantize`. -/
+theorem adaptiveStep_ok (prevW ceilingW importW chargingW : Int) :
+    0 ≤ adaptiveStep prevW ceilingW importW chargingW maxForcedPowerW ∧
+    adaptiveStep prevW ceilingW importW chargingW maxForcedPowerW ≤ maxForcedPowerW :=
+  ⟨adaptiveStep_nonneg _ _ _ _ _ (by unfold maxForcedPowerW; omega), adaptiveStep_le_max _ _ _ _ _⟩
+
+/-- Quantizing an in-range setpoint from a valid command gives a valid command. -/
+theorem hystQuantize_ok (s prev : Int) (hs : 0 ≤ s ∧ s ≤ maxForcedPowerW) (hp : CmdOk prev) :
+    CmdOk (hystQuantize s prev) := by
+  unfold CmdOk at * 
+  unfold hystQuantize quantumW hysteresisW
+  simp only [maxForcedPowerW] at *
+  split <;> omega
+
+/-- A forced charge at exactly `w` watts. -/
+def chargeAt (w : Int) (h : CmdOk w) : ControlRegisters :=
+  ⟨.forced, .charge, ⟨w.toNat, by unfold CmdOk at h; omega, by unfold CmdOk at h; omega⟩⟩
+
+/-! ## Controller state -/
+
+/-- What the controller remembers between ticks. -/
+structure ControllerState where
+  /-- Have we reached the target SOC? -/
+  targetReached : Bool := false
+  /-- Adaptive controller's setpoint, at full resolution. -/
+  setpointW     : Int := 0
+  /-- Last quantized command, the position on the 100 W ladder (for hysteresis). -/
+  cmdW          : Int := 0
+  /-- The command is one we can send as is. -/
+  cmdOk         : CmdOk cmdW := by decide
+  /-- The intent we last saw; a change resets the latch and soft-starts the controller. -/
+  lastIntent    : Option Intent := none
+  deriving Repr
+
+/-- Not actively adaptive-charging: the next entry into adaptive mode soft-starts from zero. -/
+def ControllerState.resetAdaptive (st : ControllerState) : ControllerState :=
+  { st with setpointW := 0, cmdW := 0, cmdOk := .zero }
 
 /-! ## The decision -/
 
@@ -191,10 +239,18 @@ inductive Decision
 
 def forcedStop : ControlRegisters := ⟨.forced, .stop, ⟨0, rfl, by decide⟩⟩
 
-/-- A charge command at `w` watts, clamped onto the inverter's grid (0..max, 10 W steps). -/
-def chargeAt (w : Int) : ControlRegisters :=
-  let n := min w.toNat maxForcedPowerW / 10 * 10
-  ⟨.forced, .charge, ⟨n, by omega, by omega⟩⟩
+/-- One tick of adaptive charging under a grid import ceiling, given fresh grid and battery
+power (positive is export and discharge). -/
+def adaptiveTick (st : ControllerState) (ceilingW gridW battW : Int) : Decision × ControllerState :=
+  let importW   := max 0 (-gridW)
+  let chargingW := max 0 (-battW)
+  let setpointW := adaptiveStep st.setpointW ceilingW importW chargingW maxForcedPowerW
+  let cmdW      := hystQuantize setpointW st.cmdW
+  -- The one place a new command is made, so the one place that needs a proof.
+  have cmdOk : CmdOk cmdW := hystQuantize_ok _ _ (adaptiveStep_ok ..) st.cmdOk
+  let st        := { st with setpointW, cmdW, cmdOk }
+  if cmdW < minChargeW then (.apply forcedStop .adaptiveHold, st)
+  else (.apply (chargeAt cmdW cmdOk) .adaptiveCharge, st)
 
 /-- Given the current intent, snapshot, minute of day, and controller state,
 decide on the new decision and controller state. We assume that `intent` has 
@@ -224,14 +280,7 @@ def decide (intent : Intent) (snap : Snapshot) (minute : Nat) (st : ControllerSt
                         ⟨decision, controllerState⟩
         | .adaptive ceilingW _ =>
           match snap.gridW, snap.batteryW with
-          | some gridW, some battW =>
-            let importW   := max 0 (-gridW)
-            let chargingW := max 0 (-battW)
-            let setpointW := adaptiveStep st.setpointW ceilingW importW chargingW maxForcedPowerW
-            let cmdW      := hystQuantize setpointW st.cmdW
-            let st        := { st with setpointW, cmdW }
-            if cmdW < minChargeW then (.apply forcedStop .adaptiveHold, st)
-            else (.apply (chargeAt cmdW) .adaptiveCharge, st)
+          | some gridW, some battW => adaptiveTick st ceilingW gridW battW
           | _, _ => (.leave "no fresh grid/battery power; cannot run the adaptive controller", st)
 
 /-- One reconciliation: expire the override, then decide. Returns the intent to persist. -/
@@ -242,18 +291,6 @@ def tick (intent : Intent) (snap : Snapshot) (nowUnix : Int) (minute : Nat)
   (intent, d, st)
 
 /-! ## Properties -/
-
-theorem adaptiveStep_nonneg (prevW ceilingW importW chargingW maxW : Int) (h : 0 ≤ maxW) :
-    0 ≤ adaptiveStep prevW ceilingW importW chargingW maxW := by
-  unfold adaptiveStep 
-  dsimp only
-  split <;> omega
-
-theorem adaptiveStep_le_max (prevW ceilingW importW chargingW maxW : Int) :
-    adaptiveStep prevW ceilingW importW chargingW maxW ≤ maxW := by
-  unfold adaptiveStep
-  dsimp only
-  split <;> omega
 
 /-- Climb at most one ramp step per tick. -/
 theorem adaptiveStep_ramp (prevW ceilingW importW chargingW maxW : Int) (h : 0 ≤ prevW) :
@@ -431,7 +468,8 @@ private def charge800 : ControlRegisters := ⟨.forced, .charge, ⟨800, by deci
   let i : Intent := ⟨some adaptiveWindow, none⟩
   let (d1, st1) := decide i (snap 500 (-180) 0) 120 {}
   let (d2, _)   := decide i (snap 500 (-680) (-500)) 121 st1
-  d1 == .apply (chargeAt 500) .adaptiveCharge && d2 == .apply (chargeAt 1000) .adaptiveCharge
+  d1 == .apply (chargeAt 500 (by decide)) .adaptiveCharge
+    && d2 == .apply (chargeAt 1000 (by decide)) .adaptiveCharge
 
 -- No fresh SOC: leave the inverter alone rather than guess.
 #guard match (decide ⟨some fixedWindow, none⟩ ⟨none, none, none⟩ 180 {}).1 with

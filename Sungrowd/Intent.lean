@@ -188,11 +188,15 @@ def controllerStateOfJson (gridFuseAmps : Nat) (j : Json) : Except String Contro
   let lastIntent ← match j.getObjValD "last_intent" with
     | .null => pure none
     | li    => some <$> intentOfJson gridFuseAmps li
-  return {
-    targetReached := ← field Bool j "target_reached"
-    setpointW     := ← field Int j "setpoint_w"
-    cmdW          := ← field Int j "cmd_w"
-    lastIntent }
+  let cmdW ← field Int j "cmd_w"
+  -- A hand-edited or corrupted file must not put the controller off the ladder.
+  if cmdOk : CmdOk cmdW then
+    return {
+      targetReached := ← field Bool j "target_reached"
+      setpointW     := ← field Int j "setpoint_w"
+      cmdW, cmdOk, lastIntent }
+  else
+    throw s!"cmd_w {cmdW} is not a multiple of 100 in 0..{maxForcedPowerW}"
 
 /-! ## Examples -/
 
@@ -243,5 +247,12 @@ private def err? : Except String α → Option String
 #guard
   let i : Intent := { window := none, override := some ⟨.selfConsumption, some 1792958400⟩ }
   (intentOfJson 20 (toJson i)).toOption == some i
+
+-- Controller state round-trips, and an off-ladder command is rejected.
+#guard
+  let st : ControllerState := { targetReached := true, setpointW := 1234, cmdW := 1200 }
+  (controllerStateOfJson 20 (toJson st)).toOption.map (·.cmdW) == some 1200
+#guard err? (parse "{\"target_reached\": false, \"setpoint_w\": 0, \"cmd_w\": 150}"
+    >>= controllerStateOfJson 20) == some "cmd_w 150 is not a multiple of 100 in 0..5000"
 
 end Sungrowd.Policy
