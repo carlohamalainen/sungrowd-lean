@@ -42,8 +42,16 @@ SUNGROWD_DEBUG=1 .lake/build/bin/sungrowd write forced charge 3000
 ```
 
 Run the control policy once (`Sungrowd/Policy.lean`): read the inverter, decide, and print
-what it would write. The file is either the Go daemon's `schedule.json` or its persisted intent
-(`{"charge_window": …, "manual_override": …}`).
+what it would write. The intent file is ours (see `Sungrowd/Intent.lean`), for example
+
+```json
+{"charge_window": {"mode": "adaptive", "start": "01:00", "end": "06:00",
+                   "ceiling_watts": 4320, "max_soc": 80},
+ "manual_override": {"action": "charge", "watts": 3000, "expiry": "2026-11-23T20:00:00Z"}}
+```
+
+with every key optional, or the Go daemon's `schedule.json` or persisted intent, which are read
+but never written.
 
 ```
 # Dry run (the default): nothing is written.

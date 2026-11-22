@@ -163,6 +163,43 @@ def Command.label : Command → String
 instance : ToString ControlRegisters where
   toString cr := s!"{cr.mode.label} {cr.command.label} {cr.power.watts} W"
 
+/-! ## What we ask of the inverter -/
+
+/-- The four things we ask the inverter to do. Unlike `ControlRegisters`, which can say
+"self consumption, charge at 3000 W", every value here means something: there is a power only
+where the inverter uses one. -/
+inductive Action
+  | selfConsumption
+  | stop
+  | charge (power : ForcedPower)
+  | discharge (power : ForcedPower)
+  deriving DecidableEq, Repr
+
+def Action.registers : Action → ControlRegisters
+  | .selfConsumption => .selfConsumption
+  | .stop            => ⟨.forced, .stop, ⟨0, rfl, by decide⟩⟩
+  | .charge p        => ⟨.forced, .charge, p⟩
+  | .discharge p     => ⟨.forced, .discharge, p⟩
+
+/-- What the inverter does with these registers. It ignores the command and power outside
+forced mode, and the power for a stop. -/
+def Action.ofRegisters (cr : ControlRegisters) : Action :=
+  match cr.mode, cr.command with
+  | .selfConsumption, _ => .selfConsumption
+  | .forced, .stop      => .stop
+  | .forced, .charge    => .charge cr.power
+  | .forced, .discharge => .discharge cr.power
+
+theorem Action.ofRegisters_registers (a : Action) : Action.ofRegisters a.registers = a := by
+  cases a <;> rfl
+
+instance : ToString Action where
+  toString
+    | .selfConsumption => "self consumption"
+    | .stop            => "stop"
+    | .charge p        => s!"charge {p.watts} W"
+    | .discharge p     => s!"discharge {p.watts} W"
+
 /-- JSON interpretation of raw words. We might not be able to decode the bytes
 that come back. Labels are `unknown` for values we don't model. -/
 def rawJson (v : Vector UInt16 3) : Lean.Json :=

@@ -86,9 +86,9 @@ def ChargeWindow.make? (start stop : TimeOfDay) (mode : ChargeMode) (maxSOC : Na
     else throw s!"maxSOC {maxSOC} is greater than 100"
   else throw s!"charge window has start {start} at or after end {stop}"
 
-/-- Pin the registers to a value regardless of the schedule, until `expiry`. -/
+/-- Do `action` regardless of the schedule, until `expiry`. -/
 structure ManualOverride where
-  registers : ControlRegisters
+  action    : Action
   /-- Unix seconds. -/
   expiry    : Option Int
   deriving Repr, DecidableEq
@@ -261,7 +261,7 @@ def decide (intent : Intent) (snap : Snapshot) (minute : Nat) (st : ControllerSt
   let st := if st.lastIntent == some intent then st
     else { targetReached := false, setpointW := 0, cmdW := 0, lastIntent := some intent }
   match intent.override, intent.window with
-  | some o, _ => (.apply o.registers .manualOverride, st.resetAdaptive)
+  | some o, _ => (.apply o.action.registers .manualOverride, st.resetAdaptive)
   | none, none => (.apply .selfConsumption .scheduleDisabled, st.resetAdaptive)
   | none, some w =>
     match snap.socTenths with
@@ -318,7 +318,7 @@ theorem hystQuantize_ladder (setpointW prevW : Int) (h : prevW % quantumW = 0) :
 /-- A manual override always wins. -/
 theorem decide_override (intent : Intent) (snap : Snapshot) (minute : Nat) (st : ControllerState)
     (o : ManualOverride) (h : intent.override = some o) :
-    (decide intent snap minute st).1 = .apply o.registers .manualOverride := by
+    (decide intent snap minute st).1 = .apply o.action.registers .manualOverride := by
   -- short version:
   -- unfold decide
   -- rw [h]
@@ -327,7 +327,7 @@ theorem decide_override (intent : Intent) (snap : Snapshot) (minute : Nat) (st :
   obtain ⟨window, override⟩ := intent 
   subst h 
   unfold decide 
-  change (Decision.apply o.registers .manualOverride, _).1 = _
+  change (Decision.apply o.action.registers .manualOverride, _).1 = _
   rfl 
 
 def Decision.charges : Decision → Bool
@@ -478,7 +478,7 @@ private def charge800 : ControlRegisters := ⟨.forced, .charge, ⟨800, by deci
 
 -- An override until t = 1000 wins at t = 999 and is cleared (and persisted) at t = 1000.
 #guard
-  let o : ManualOverride := ⟨forcedStop, some 1000⟩
+  let o : ManualOverride := ⟨.stop, some 1000⟩
   let i : Intent := ⟨some fixedWindow, some o⟩
   let (i1, d1, _) := tick i (snap 300) 999 180 {}
   let (i2, d2, _) := tick i (snap 300) 1000 180 {}

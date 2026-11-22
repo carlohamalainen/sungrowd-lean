@@ -1,0 +1,3 @@
+{"charge_window": {"mode": "adaptive", "start": "00:00", "end": "23:59",
+                   "ceiling_watts": 4320, "max_soc": 80},
+ "manual_override": {"action": "discharge", "watts": 2000}}
