@@ -56,7 +56,7 @@ def nominalGridVoltage : Nat := 240
 /-- How the charge rate is decided inside the window. -/
 inductive ChargeMode
   /-- Charge at a constant rate. The inverter snaps to 10 W increments, so let's avoid anything under 10. -/
-  | fixed    (power : ForcedPower) (h : 10 < power.watts)
+  | fixed    (power : ForcedPower) (h : 10 ≤ power.watts)
   /-- Recompute the rate every tick so that total grid import stays at `ceilingW`. -/
   | adaptive (ceilingW : Nat) (h : 100 ≤ ceilingW)
   deriving Repr, DecidableEq

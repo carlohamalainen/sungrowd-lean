@@ -72,7 +72,7 @@ def scheduleOfJson (gridFuseAmps : Nat) (j : Json) : Except String (Option Charg
       let w ← field Nat j "charge_watts"
       let some p := ForcedPower.ofWatts? w
         | throw s!"charge watts {w} is greater than the maximum {maxForcedPowerW}"
-      if h : 10 < p.watts then pure (ChargeMode.fixed p h)
+      if h : 10 ≤ p.watts then pure (ChargeMode.fixed p h)
       else throw s!"charge watts {w} is too low"
     | "adaptive" =>
       let c := (← optField Nat j "ceiling_watts").getD 0
