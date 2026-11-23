@@ -5,5 +5,7 @@
 .envrc
 
 sungrowd.db
+sungrowd.db-wal
+sungrowd.db-shm
 
 tmp/

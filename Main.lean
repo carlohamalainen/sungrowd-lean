@@ -79,7 +79,7 @@ def usage : String := "usage:
   sungrowd write forced charge|discharge <watts> [--dry-run]
   sungrowd tick <intent.json> [--state <state.json>] [--apply]
                                              decide once from a schedule or intent file
-  sungrowd run <intent.json> [--apply]       the daemon: tick every 5 s, serve /metrics and /healthz"
+  sungrowd run [--apply]                     the daemon: tick every 5 s, serve /metrics and /healthz"
 
 def controlMain (host : String) (port : UInt16) (debug : Bool) : IO UInt32 := do
   match ← (withClient host port debug readControl).run.block with
@@ -196,18 +196,34 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     let thresholdS ← envNat staleEnvVar staleDefaultS
     let listen     := (← IO.getEnv listenEnvVar).getD listenDefault
     let (lh, lp)   ← orThrow listenEnvVar (parseListen listen)
-    unless ← args.intentPath.pathExists do throw s!"{args.intentPath}: no such file"
+    let dbPath     := (← IO.getEnv dbEnvVar).getD dbDefault
+    let store ← try Store.open dbPath catch e => throw s!"opening the database {dbPath}: {e}"
     let (blocks, _) ← loadBlocks
-    return (fuse, thresholdS, listen, lh, lp, blocks)
-  let (fuse, thresholdS, listen, lh, lp, blocks) ← match ← setup.run with
+    return (fuse, thresholdS, listen, lh, lp, dbPath, store, blocks)
+  let (fuse, thresholdS, listen, lh, lp, dbPath, store, blocks) ← match ← setup.run with
     | .ok v    => pure v
     | .error e =>
       IO.eprintln s!"error: {e}"
       return 2
-  log.info "starting" [("inverter", s!"{host}:{port}"), ("intent", args.intentPath.toString),
+  log.info "starting" [("inverter", s!"{host}:{port}"), ("db", dbPath),
     ("apply", toString args.apply), ("listen", listen), ("tick_ms", toString tickIntervalMs)]
 
-  let d : Daemon := { host, port, debug, fuse, args, log, blocks,
+  -- Go's startup seeding: a fresh database takes its intent from the schedule file. After that
+  -- the database is the only source of truth, and the file is ignored.
+  if (← store.intentJson).isNone then
+    let path : System.FilePath := (← IO.getEnv scheduleEnvVar).getD scheduleDefault
+    let seeded : ExceptT String IO Policy.Intent := do
+      orThrow path.toString (Policy.intentOfFile fuse (← readJsonFile path))
+    match ← seeded.run with
+    | .ok i =>
+      store.saveIntent i
+      log.info "seeded the intent from the schedule file"
+        [("path", path.toString), ("intent", (Lean.toJson i).compress)]
+    | .error e =>
+      log.error "could not seed the intent from the schedule file; continuing without it"
+        [("path", path.toString), ("err", e)]
+
+  let d : Daemon := { host, port, debug, fuse, args, log, store, blocks,
                       shared := ← IO.mkRef {}, lastConnect := ← IO.mkRef 0 }
 
   -- Prime the control-register cache, but start degraded rather than failing if the inverter

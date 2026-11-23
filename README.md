@@ -67,23 +67,39 @@ but never written.
 SUNGROWD_GRID_FUSE_A=20 .lake/build/bin/sungrowd tick schedule.json
 ```
 
-Run the daemon: tick every 5 s, re-reading the intent file each time, and serve `/metrics`
-(Prometheus) and `/healthz`. Like `tick`, it only writes to the inverter with `--apply`.
+Run the daemon: tick every 5 s and serve `/metrics` (Prometheus) and `/healthz`. Like `tick`,
+it only writes to the inverter with `--apply`.
+
+The intent lives in a SQLite database (`SUNGROWD_DB`, default `sungrowd.db`) with the Go
+daemon's schema. A fresh database is seeded from `SUNGROWD_SCHEDULE` (default `schedule.json`:
+Go's schedule format, or an intent in ours); after that the file is ignored. Every write
+attempt is recorded in `control_write`, and an expired override is cleared from the database.
 
 ```
 # Shadow mode: log what it would write.
-.lake/build/bin/sungrowd run samples/adaptive-all-day.json
+SUNGROWD_SCHEDULE=samples/adaptive-all-day.json .lake/build/bin/sungrowd run
 
-# Control the inverter. An expired override is cleared from the intent file.
-.lake/build/bin/sungrowd run intent.json --apply
+# Control the inverter.
+.lake/build/bin/sungrowd run --apply
 
 curl localhost:9180/metrics
 curl localhost:9180/healthz
+sqlite3 sungrowd.db 'select recorded_at, ok, err from control_write order by id desc limit 5'
 ```
 
-Settings, with Go's defaults: `SUNGROWD_LISTEN` (`0.0.0.0:9180`),
-`SUNGROWD_STALE_THRESHOLD_SECONDS` (120), `SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`,
-`error`), `SUNGROWD_GRID_FUSE_A` (20).
+To move over from the Go daemon, stop it and copy its database: the Lean daemon reads Go's
+intent format and keeps its `control_write` history, but writes only its own format, so the
+Go daemon can't use the database afterwards.
+
+Settings, with Go's defaults: `SUNGROWD_DB` (`sungrowd.db`), `SUNGROWD_SCHEDULE`
+(`schedule.json`), `SUNGROWD_LISTEN` (`0.0.0.0:9180`), `SUNGROWD_STALE_THRESHOLD_SECONDS` (120),
+`SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`, `error`), `SUNGROWD_GRID_FUSE_A` (20).
+
+## Tests
+
+Most checks are `#guard`s and proofs, which `lake build` runs. `lake test` runs the rest, which
+need IO (e.g. the database tests, on temporary files). `lake test -- path/to/sungrowd.db` also
+prints the intent stored in that database, e.g. a copy of the Go daemon's.
 
 ## Testing without the inverter
 
@@ -93,7 +109,7 @@ Settings, with Go's defaults: `SUNGROWD_LISTEN` (`0.0.0.0:9180`),
 ```
 uv run --no-project scripts/fake_inverter.py &
 export SUNGROWD_WINET_HOST=127.0.0.1 SUNGROWD_WINET_PORT=15020
-.lake/build/bin/sungrowd run samples/adaptive-all-day.json --apply
+SUNGROWD_DB=tmp/test.db SUNGROWD_SCHEDULE=samples/adaptive-all-day.json .lake/build/bin/sungrowd run --apply
 ```
 
 # TODO

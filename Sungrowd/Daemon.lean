@@ -1,14 +1,18 @@
 import Sungrowd.Inverter
 import Sungrowd.Intent
 import Sungrowd.Log
+import Sungrowd.Store
 
 /-! # The daemon: `sungrowd run`
 
-Go's `Server.Run` and `handle`, with the intent in a file instead of SQLite. Every constant
-and policy here is Go's:
+Go's `Server.Run` and `handle`. Every constant and policy here is Go's:
 
+* the intent lives in the database (`Sungrowd/Store.lean`), seeded from a schedule file when
+  the database has none;
 * tick every 5 s, and once at startup;
 * each tick re-reads the intent; if it can't, leave the inverter as it is;
+* an expired override is cleared from the database;
+* every write attempt is recorded in `control_write`;
 * read the sensors every tick, 3 attempts on a fresh connection each (Sungrow inverters return
   modbus exception 4 in short clusters), at most one new connection per second;
 * trust cached control registers for 30 s before reading them again;
@@ -33,6 +37,11 @@ def listenDefault        : String := "0.0.0.0:9180"
 def staleEnvVar          : String := "SUNGROWD_STALE_THRESHOLD_SECONDS"
 def staleDefaultS        : Nat := 120
 def logLevelEnvVar       : String := "SUNGROWD_LOG_LEVEL"
+def dbEnvVar             : String := "SUNGROWD_DB"
+def dbDefault            : String := "sungrowd.db"
+/-- Seeds a fresh database's intent: Go's `schedule.json`, or an intent in our format. -/
+def scheduleEnvVar       : String := "SUNGROWD_SCHEDULE"
+def scheduleDefault      : String := "schedule.json"
 
 /-! ## Helpers shared with `tick` -/
 
@@ -69,14 +78,12 @@ structure Shared where
   control       : Option (Vector UInt16 3 × Nat) := none
 
 structure RunArgs where
-  intentPath : System.FilePath
-  apply      : Bool
+  apply : Bool
 
 def parseRun : List String → Except String RunArgs
-  | [p]              => pure ⟨p, false⟩
-  | [p, "--apply"]   => pure ⟨p, true⟩
-  | ["--apply", p]   => pure ⟨p, true⟩
-  | args             => throw s!"run: expected <intent.json> [--apply], got {args}"
+  | []          => pure ⟨false⟩
+  | ["--apply"] => pure ⟨true⟩
+  | args        => throw s!"run: expected [--apply], got {args}"
 
 structure Daemon where
   host        : String
@@ -85,6 +92,7 @@ structure Daemon where
   fuse        : Nat
   args        : RunArgs
   log         : Log
+  store       : Store
   shared      : IO.Ref Shared
   /-- Monotonic ms of the last connection, for Go's one-per-second connection limiter. -/
   lastConnect : IO.Ref Nat
@@ -153,11 +161,13 @@ def Daemon.applyControl (d : Daemon) (desired : ControlRegisters) (reason : Stri
   let op ← match ← (d.withConn fun c => guardIO (safeWriteControl c desired)).run.block with
     | .ok op   => pure op
     | .error e =>
-      d.log.error "control write could not be sent — inverter left unchanged"
-        [("reason", reason), ("err", toString e)]
-      return
-  -- Go audits every attempt in its `control_write` table; we log it.
-  d.log.info "control write" [("op", (Lean.toJson op).compress)]
+      -- Couldn't connect: still an attempt, so still audited.
+      pure { recordedAt := ← Std.Time.Timestamp.now, before := none, intended := desired,
+             after := none, outcome := .notSent e }
+  -- Audit every attempt, as Go does.
+  d.log.debug "control write" [("op", (Lean.toJson op).compress)]
+  try discard <| d.store.insertControlWrite op
+  catch e => d.log.error "could not record control write" [("err", toString e)]
   match op.outcome with
   | .ok | .noOp =>
     d.setControl want
@@ -181,17 +191,11 @@ structure Worker where
   effective    : Option Policy.Intent := none
   lastDecision : Option Policy.Decision := none
 
-def writeFileAtomic (path : System.FilePath) (content : String) : IO Unit := do
-  let tmp := path.addExtension "tmp"
-  IO.FS.writeFile tmp content
-  IO.FS.rename tmp path
-
 /-- One tick: Go's `handle`. -/
 def Daemon.handle (d : Daemon) (w : Worker) : IO Worker := do
-  -- The intent file is the single source of truth for what the user wants.
-  let intent ← match ← (do
-      orThrow d.args.intentPath.toString
-        (Policy.intentOfFile d.fuse (← readJsonFile d.args.intentPath)) : ExceptT String IO _).run with
+  -- The database is the single source of truth for what the user wants.
+  let loaded ← try d.store.loadIntent d.fuse catch e => pure (.error (toString e))
+  let intent ← match loaded with
     | .ok i    => pure i
     | .error e =>
       -- Don't fall back to a mode the user never asked for.
@@ -215,14 +219,15 @@ def Daemon.handle (d : Daemon) (w : Worker) : IO Worker := do
   let minute  := brisbaneMinute nowUnix
   let (effective, decision, st) := Policy.tick intent snap nowUnix minute w.st
 
-  -- Auto-expire a manual override whose deadline has passed.
-  if effective != intent && w.effective != some effective then
-    if d.args.apply then
-      d.log.info "manual override expired; clearing" [("path", d.args.intentPath.toString)]
-      try writeFileAtomic d.args.intentPath ((Lean.toJson effective).pretty ++ "\n")
-      catch e => d.log.error "could not clear expired override" [("err", toString e)]
-    else
-      d.log.info "manual override expired; not clearing it from the file (no --apply)"
+  -- Auto-expire a manual override whose deadline has passed: clear it from the database (unless
+  -- it has been replaced since we loaded it), and carry on this tick without it.
+  if effective != intent then
+    d.log.info "manual override expired; clearing"
+      [("override", (Lean.toJson intent.override).compress)]
+    let clear (i : Policy.Intent) := if i.override == intent.override then { i with override := none } else i
+    match ← (try d.store.updateIntent d.fuse clear catch e => pure (.error (toString e))) with
+    | .ok _    => pure ()
+    | .error e => d.log.error "could not clear expired override" [("err", e)]
 
   d.log.debug "tick" [("soc", toString snap.socTenths), ("grid_w", toString snap.gridW),
     ("battery_w", toString snap.batteryW), ("decision", decision.show)]

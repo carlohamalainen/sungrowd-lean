@@ -1,6 +1,7 @@
 name = "sungrowd"
 version = "0.1.0"
 defaultTargets = ["sungrowd", "Sungrowd"]
+testDriver = "tests"
 
 [[lean_lib]]
 name = "Modbus"
@@ -11,3 +12,13 @@ name = "Sungrowd"
 [[lean_exe]]
 name = "sungrowd"
 root = "Main"
+
+# `lake test`: what `#guard` can't check, because it needs IO (e.g. a real database file).
+[[lean_exe]]
+name = "tests"
+root = "Tests"
+
+[[require]]
+name = "leansqlite"
+git = "https://github.com/leanprover/leansqlite"
+rev = "v4.36.0"
