@@ -67,6 +67,35 @@ but never written.
 SUNGROWD_GRID_FUSE_A=20 .lake/build/bin/sungrowd tick schedule.json
 ```
 
+Run the daemon: tick every 5 s, re-reading the intent file each time, and serve `/metrics`
+(Prometheus) and `/healthz`. Like `tick`, it only writes to the inverter with `--apply`.
+
+```
+# Shadow mode: log what it would write.
+.lake/build/bin/sungrowd run samples/adaptive-all-day.json
+
+# Control the inverter. An expired override is cleared from the intent file.
+.lake/build/bin/sungrowd run intent.json --apply
+
+curl localhost:9180/metrics
+curl localhost:9180/healthz
+```
+
+Settings, with Go's defaults: `SUNGROWD_LISTEN` (`0.0.0.0:9180`),
+`SUNGROWD_STALE_THRESHOLD_SECONDS` (120), `SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`,
+`error`), `SUNGROWD_GRID_FUSE_A` (20).
+
+## Testing without the inverter
+
+`scripts/fake_inverter.py` is a fake Modbus TCP inverter on localhost (see its docstring for the
+`FAKE_*` settings, including injected modbus exceptions):
+
+```
+uv run --no-project scripts/fake_inverter.py &
+export SUNGROWD_WINET_HOST=127.0.0.1 SUNGROWD_WINET_PORT=15020
+.lake/build/bin/sungrowd run samples/adaptive-all-day.json --apply
+```
+
 # TODO
 
 Try <https://github.com/scidonia/leanin> 
