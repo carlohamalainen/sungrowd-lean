@@ -122,7 +122,13 @@ Go daemon can't use the database afterwards.
 
 Settings, with Go's defaults: `SUNGROWD_DB` (`sungrowd.db`), `SUNGROWD_SCHEDULE`
 (`schedule.json`), `SUNGROWD_LISTEN` (`0.0.0.0:9180`), `SUNGROWD_STALE_THRESHOLD_SECONDS` (120),
-`SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`, `error`), `SUNGROWD_GRID_FUSE_A` (20).
+`SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`, `error`), `SUNGROWD_GRID_FUSE_A` (20),
+`SUNGROWD_NTFY_TOPIC` (unset: no notifications), `SUNGROWD_NTFY_SERVER` (`https://ntfy.sh`).
+
+With `SUNGROWD_NTFY_TOPIC` set, the daemon pushes an ntfy notification when the inverter data goes
+stale (no good read for `SUNGROWD_STALE_THRESHOLD_SECONDS`, checked every 15 s) and again when it
+recovers, as Go does. It posts with `curl`, which must be on the `PATH`: Lean's standard library
+has no HTTP client yet.
 
 ## Tests
 

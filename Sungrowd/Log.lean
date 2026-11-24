@@ -54,4 +54,15 @@ def Log.error (l : Log) (msg : String) (kvs : List (String × String) := []) : I
 #guard (LogLevel.parse "WARNING").label == "WARN"
 #guard (LogLevel.parse "nonsense").label == "INFO"
 
+/-- Go's `Duration.String`, after `Round(time.Second)`: `45s`, `1m30s`, `1h0m0s`. -/
+def goDuration (ms : Nat) : String :=
+  let s := (ms + 500) / 1000
+  let (h, m, sec) := (s / 3600, s % 3600 / 60, s % 60)
+  if s == 0 then "0s"
+  else if h > 0 then s!"{h}h{m}m{sec}s"
+  else if m > 0 then s!"{m}m{sec}s"
+  else s!"{sec}s"
+
+#guard goDuration 44_600 == "45s" && goDuration 90_000 == "1m30s" && goDuration 3_600_000 == "1h0m0s"
+
 end Sungrowd

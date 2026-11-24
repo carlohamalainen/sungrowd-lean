@@ -5,6 +5,7 @@ import Sungrowd.Inverter
 import Sungrowd.Daemon
 import Sungrowd.Http
 import Sungrowd.Ui
+import Sungrowd.Notify
 import Std.Data.HashMap
 import Std.Http
 
@@ -192,6 +193,7 @@ def tickMain (host : String) (port : UInt16) (debug : Bool) (args : TickArgs) : 
 
 def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO UInt32 := do
   let log : Log := ⟨LogLevel.parse ((← IO.getEnv logLevelEnvVar).getD "info")⟩
+  let startMs := (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val
   let setup : ExceptT String IO _ := do
     let fuse       ← envNat gridFuseEnvVar gridFuseAmpsDefault
     let thresholdS ← envNat staleEnvVar staleDefaultS
@@ -244,7 +246,14 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     return 2
   log.info "listening" [("addr", listen)]
 
+  -- Go's watchStaleness, beside the worker: an ntfy push when the data goes stale and when it
+  -- recovers, if `SUNGROWD_NTFY_TOPIC` is set.
+  let stopWatcher ← Std.Channel.new (some 1)
+  let watcher ← IO.asTask (prio := .dedicated)
+    (watchStaleness d.shared log (← Ntfy.ofEnv) thresholdS startMs stopWatcher)
+
   d.loop
+  discard <| stopWatcher.trySend ()
 
   -- Go gives open requests up to 10 s. Ours are short, and `shutdown` cancels them anyway. The
   -- inverter is left as it is, as in Go: forced mode stays forced until something changes it.
@@ -253,6 +262,8 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     Selectable.one #[.case server.waitShutdownSelector pure,
                      .case (← Selector.sleep (msOffset 10000)) pure]
   try stop.block catch e => log.error "http shutdown" [("err", toString e)]
+  -- At most one push in flight, which curl bounds at 10 s.
+  discard <| IO.wait watcher
   log.info "stopped"
   return 0
 
