@@ -87,6 +87,26 @@ curl localhost:9180/healthz
 sqlite3 sungrowd.db 'select recorded_at, ok, err from control_write order by id desc limit 5'
 ```
 
+Change the intent while it runs (Go's control API, with our JSON formats; the worker ticks at
+once after a change):
+
+```
+# A manual override, in our format; "expiry" is RFC 3339 or "HH:MM" (the next time Brisbane's
+# clock shows it), and may be left out.
+curl -X POST localhost:9180/control/override -d '{"action": "charge", "watts": 3000, "expiry": "06:00"}'
+curl -X POST localhost:9180/control/override -d null        # back to the schedule
+
+# The charge window (Go's format is accepted too); null removes it.
+curl -X POST localhost:9180/control/schedule \
+  -d '{"mode": "adaptive", "start": "01:00", "end": "06:00", "ceiling_watts": 4320, "max_soc": 80}'
+curl -X POST localhost:9180/control/schedule -d null
+
+# What the daemon knows: the stored intent, the last decision, controller state, sensors.
+curl localhost:9180/diag
+```
+
+A bad body is a 400 and changes nothing.
+
 To move over from the Go daemon, stop it and copy its database: the Lean daemon reads Go's
 intent format and keeps its `control_write` history, but writes only its own format, so the
 Go daemon can't use the database afterwards.

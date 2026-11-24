@@ -224,7 +224,8 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
         [("path", path.toString), ("err", e)]
 
   let d : Daemon := { host, port, debug, fuse, args, log, store, blocks,
-                      shared := ← IO.mkRef {}, lastConnect := ← IO.mkRef 0 }
+                      shared := ← IO.mkRef {}, lastConnect := ← IO.mkRef 0,
+                      wake := ← Std.Channel.new (some 1) }
 
   -- Prime the control-register cache, but start degraded rather than failing if the inverter
   -- is unreachable: otherwise a restart during an outage never serves /healthz or /metrics.
@@ -235,23 +236,14 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     log.warn "initial inverter read failed; starting degraded" [("err", toString e)]
 
   let serve : Async Http.Server := do
-    Http.Server.serve (← resolve lh lp) (httpHandler d.shared thresholdS)
+    Http.Server.serve (← resolve lh lp) 
+      (Api.handler { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake })
   let _server ← try serve.block catch e => do
     IO.eprintln s!"error: listening on {listen}: {e}"
     return 2
   log.info "listening" [("addr", listen)]
 
-  -- Tick at once, then every `tickIntervalMs` (skipping ticks if one overruns, like a Go ticker).
-  let mut w : Worker := {}
-  let mut next ← IO.monoMsNow
-  repeat
-    w ← try d.handle w catch e => do
-      log.error "tick failed" [("err", toString e)]
-      pure w
-    next := next + tickIntervalMs
-    let now ← IO.monoMsNow
-    while next ≤ now do next := next + tickIntervalMs
-    IO.sleep (next - now).toUInt32
+  d.loop
   return 0
 
 def main (args : List String) : IO UInt32 := do

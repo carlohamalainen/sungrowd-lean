@@ -2,6 +2,7 @@ import Sungrowd.Inverter
 import Sungrowd.Intent
 import Sungrowd.Log
 import Sungrowd.Store
+import Std.Sync.Channel
 
 /-! # The daemon: `sungrowd run`
 
@@ -9,7 +10,7 @@ Go's `Server.Run` and `handle`. Every constant and policy here is Go's:
 
 * the intent lives in the database (`Sungrowd/Store.lean`), seeded from a schedule file when
   the database has none;
-* tick every 5 s, and once at startup;
+* tick every 5 s, once at startup, and at once when an HTTP handler changes the intent;
 * each tick re-reads the intent; if it can't, leave the inverter as it is;
 * an expired override is cleared from the database;
 * every write attempt is recorded in `control_write`;
@@ -76,6 +77,10 @@ structure Shared where
   readErrors    : Nat := 0
   /-- The control registers as last read or written, and when (monotonic ms). -/
   control       : Option (Vector UInt16 3 × Nat) := none
+  /-- The last tick, for `/diag`: the intent after expiry, the decision, the controller state. -/
+  effective     : Option Policy.Intent := none
+  decision      : Option Policy.Decision := none
+  controller    : Policy.ControllerState := {}
 
 structure RunArgs where
   apply : Bool
@@ -98,6 +103,9 @@ structure Daemon where
   lastConnect : IO.Ref Nat
   /-- The read blocks, unread, as `loadBlocks` gave them. -/
   blocks      : Array ReadBlock
+  /-- Go's buffered-1 wake channel: the HTTP handlers nudge the worker to tick now, after
+  changing the intent. -/
+  wake        : Std.Channel Unit
 
 /-- A fresh connection, at most one per `connectSpacingMs` (Go's `withConn`). -/
 def Daemon.withConn (d : Daemon) (k : Client → M α) : M α := do
@@ -238,6 +246,25 @@ def Daemon.handle (d : Daemon) (w : Worker) : IO Worker := do
   | .leave why => d.log.error "leaving the inverter as it is" [("why", why)]
   | .apply r reason => d.applyControl r reason.label
 
+  d.shared.modify fun s =>
+    { s with effective := some effective, decision := some decision, controller := st }
   return { st, loaded := some intent, effective := some effective, lastDecision := some decision }
+
+/-- Go's worker loop: tick at once, then every `tickIntervalMs` (skipping ticks if one overruns,
+like a Go ticker), and also whenever `wake` has a message. A wake doesn't move the schedule. -/
+def Daemon.loop (d : Daemon) : IO Unit := do
+  let mut w : Worker := {}
+  let mut next ← IO.monoMsNow
+  repeat
+    w ← try d.handle w catch e => do
+      d.log.error "tick failed" [("err", toString e)]
+      pure w
+    let now ← IO.monoMsNow
+    while next ≤ now do next := next + tickIntervalMs
+    let wait : Async Unit := do
+      Selectable.one #[
+        .case (← Selector.sleep (msOffset (next - now))) pure,
+        .case d.wake.recvSelector pure]
+    wait.block
 
 end Sungrowd
