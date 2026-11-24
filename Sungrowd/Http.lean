@@ -1,6 +1,7 @@
 import Std.Http
 import Sungrowd.Daemon
 import Sungrowd.Store
+import Sungrowd.Prometheus
 
 /-! # The daemon's HTTP endpoints, as in Go: `/metrics`, `/healthz`, `/diag` and the control API -/
 
@@ -120,8 +121,36 @@ structure Api where
   fuse       : Nat
   log        : Log
   wake       : Std.Channel Unit
+  /-- For the actuals; none without `SUNGROWD_PROMETHEUS_URL`. -/
+  prom       : Option Prom := none
+  /-- Go's forecast correction is on (`SUNGROWD_FORECAST_SCALE` > 0, the default). -/
+  corrected  : Bool := true
 
 def maxBodyBytes : UInt64 := 65536
+
+/-- Go's `actualHandler`: `?date=YYYY-MM-DD`, or the last `?days=N` complete days (default 7, at
+most 90), newest first; `null` kWh for a day without data. -/
+def actualJson (p : Prom) (log : Log) (date days : Option String) (nowUnix : Int) :
+    IO (Except (Http.Status × String) Json) := do
+  let dates ← match date with
+    | some d => match parseDate? d with
+      | some day => pure [day]
+      | none     => return .error (.badRequest, "invalid date, want YYYY-MM-DD")
+    | none =>
+      let n := match days.bind String.toNat? with
+        | some v => if 0 < v && v ≤ 90 then v else 7
+        | none   => 7
+      let today := brisbaneDay nowUnix
+      pure ((List.range n).map fun i => today - (i + 1 : Nat))
+  let mut rows := #[]
+  for day in dates do
+    match ← (p.actualPVForDay day).run with
+    | .error e =>
+      log.error "actual query" [("date", dateString day), ("err", e)]
+      return .error (.badGateway, e)
+    | .ok kwh =>
+      rows := rows.push (Json.mkObj [("date", dateString day), ("kwh", (kwh.map (·.toJson)).getD .null)])
+  return .ok (Json.mkObj [("days", .arr rows)])
 
 def Api.loadIntent (api : Api) : IO (Except String Intent) :=
   try (← Store.open api.dbPath).loadIntent api.fuse
@@ -174,6 +203,19 @@ def Api.respond (api : Api) (req : Http.Request Http.Body.Stream) : Reply := do
   | "/diag" =>
     if method != .get then notAllowed else
     Http.Response.ok.json (diagJson s (← api.loadIntent)).pretty
+  | "/actual" =>
+    if method != .get then notAllowed else
+    match api.prom with
+    | none => plain .serviceUnavailable "actuals unavailable: SUNGROWD_PROMETHEUS_URL not set"
+    | some p =>
+      let param (k : String) : Option String := do
+        let some v := req.line.uri.query.find? k | none
+        let v ← v
+        v.decode
+      let nowUnix := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
+      match ← actualJson p api.log (param "date") (param "days") nowUnix with
+      | .ok j              => Http.Response.ok.json j.pretty
+      | .error (status, e) => plain status e
   | "/control/override" =>
     if method != .post then notAllowed else
     withBody req.body fun j => do

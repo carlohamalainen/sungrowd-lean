@@ -1,5 +1,6 @@
 import Datastar
 import Sungrowd.Http
+import Sungrowd.Format
 
 /-! # The web UI: Go's `ui.go`
 
@@ -10,8 +11,9 @@ are Go's, character for character: the same elements, classes and format strings
 Everything goes through the Datastar SDK: `sseResponse` for the streams, `patchElements` and
 `patchSignals` for the events, `readSignals` for what the page sends.
 
-Not ported yet: the forecast, forecast-vs-actual and SOC-history panels need Solcast and
-Prometheus, so they show what Go shows without them. -/
+SOC history and forecast vs actual come from Prometheus (`Sungrowd/Prometheus.lean`), when
+`SUNGROWD_PROMETHEUS_URL` is set. Not ported yet: Solcast, so the forecast panel and the forecast
+columns show what Go shows without a forecast. -/
 
 namespace Sungrowd
 
@@ -20,105 +22,6 @@ open Lean (Json JsonNumber toJson)
 open Datastar
 open Sungrowd.Policy Sungrowd.Control Sungrowd.Inverter
 open Modbus (msOffset)
-
-/-! ## Go's formatting, exactly -/
-
-/-- Go's `%.{places}f` of `num / den`, or `%+.{places}f` with `plus`. Exact, rounding half away
-from zero, where Go rounds the nearest float. A negative value keeps its sign even when it rounds
-to zero, as Go's does: `-0.00`. -/
-def fixedFrac (num : Int) (den : Nat) (places : Nat) (plus : Bool := false) : String :=
-  let sign := if num < 0 then "-" else if plus then "+" else ""
-  let scaled := (2 * num.natAbs * 10 ^ places + den) / (2 * den)
-  sign ++ withDecimals scaled places
-
-/-- An exact decimal, `m × 10^-e`, so the UI never needs a float. -/
-structure Dec where
-  m : Int
-  e : Nat := 0
-  deriving Repr
-
-namespace Dec
-
-def ofJsonNumber (n : JsonNumber) : Dec := ⟨n.mantissa, n.exponent⟩
-
-def align (a b : Dec) : Int × Int × Nat :=
-  let e := max a.e b.e
-  (a.m * 10 ^ (e - a.e), b.m * 10 ^ (e - b.e), e)
-
-instance : Add Dec := ⟨fun a b => let (x, y, e) := a.align b; ⟨x + y, e⟩⟩
-instance : Sub Dec := ⟨fun a b => let (x, y, e) := a.align b; ⟨x - y, e⟩⟩
-
-def lt (a b : Dec) : Bool := let (x, y, _) := a.align b; x < y
-
-/-- `a / 10^k`. -/
-def shift (a : Dec) (k : Nat) : Dec := ⟨a.m, a.e + k⟩
-
-/-- `round(a × k)`, half away from zero. -/
-def roundMul (a : Dec) (k : Nat) : Int :=
-  let q := (2 * a.m.natAbs * k + 10 ^ a.e) / (2 * 10 ^ a.e)
-  if a.m < 0 then -q else q
-
-/-- Go's `%.{places}f`. -/
-def fixed (a : Dec) (places : Nat) (plus : Bool := false) : String :=
-  fixedFrac a.m (10 ^ a.e) places plus
-
-/-- Go's `%v` (and `%g`, for these values): no trailing zeros. -/
-partial def short (a : Dec) : String :=
-  if a.e > 0 && a.m % 10 == 0 then short ⟨a.m / 10, a.e - 1⟩ else withDecimals a.m a.e
-
-def toJson (a : Dec) : Json := .num ⟨a.m, a.e⟩
-
-end Dec
-
-#guard fixedFrac 1234 1000 2 == "1.23"
-#guard fixedFrac (-1) 1000 2 (plus := true) == "-0.00"
-#guard fixedFrac 0 1000 2 (plus := true) == "+0.00"
-#guard fixedFrac 4320 240 1 == "18.0"
-#guard (Dec.mk 50 1).short == "5" && (Dec.mk 58 1).short == "5.8" && (Dec.mk 20 0).short == "20"
-#guard (Dec.mk 15 1).roundMul 1000 == 1500
-
-/-- Go's `html.EscapeString`. -/
-def htmlEscape (s : String) : String :=
-  s.foldl (init := "") fun acc c => acc ++ match c with
-    | '<'  => "&lt;"
-    | '>'  => "&gt;"
-    | '&'  => "&amp;"
-    | '\'' => "&#39;"
-    | '"'  => "&#34;"
-    | c    => c.toString
-
-#guard htmlEscape "a<b & \"c\"" == "a&lt;b &amp; &#34;c&#34;"
-
-/-! ### Brisbane wall-clock time -/
-
-private def two (n : Nat) : String := if n < 10 then s!"0{n}" else toString n
-
-/-- Day of month and month (1–12) of a day number since 1970-01-01 (Hinnant's `civil_from_days`). -/
-def dayMonth (days : Int) : Nat × Nat :=
-  let z := days + 719468
-  let era := z / 146097
-  let doe := z - era * 146097
-  let yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
-  let doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
-  let mp := (5 * doy + 2) / 153
-  let d := doy - (153 * mp + 2) / 5 + 1
-  let m := if mp < 10 then mp + 3 else mp - 9
-  (d.toNat, m.toNat)
-
-/-- Go's layout `"15:04"`, or `"15:04:05"` with `seconds`. -/
-def brisbaneClock (unix : Int) (seconds : Bool := false) : String :=
-  let t := (unix + brisbaneOffsetS) % 86400
-  let hm := s!"{two (t / 3600).toNat}:{two (t % 3600 / 60).toNat}"
-  if seconds then s!"{hm}:{two (t % 60).toNat}" else hm
-
-/-- Go's layout `"2 Jan 15:04:05"`. -/
-def brisbaneStamp (unix : Int) : String :=
-  let (d, m) := dayMonth ((unix + brisbaneOffsetS) / 86400)
-  let months := #["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-  s!"{d} {months[m - 1]!} {brisbaneClock unix (seconds := true)}"
-
-#guard brisbaneStamp 1795412249 == "23 Nov 15:37:29"
-#guard brisbaneClock 1795464000 == "06:00"
 
 /-! ## Labels -/
 
@@ -301,11 +204,101 @@ def renderDiag (j : Json) : String :=
 def renderClock (unix : Int) : String :=
   s!"<span id=\"clock\">{brisbaneClock unix (seconds := true)} AEST</span>"
 
-/-- What Go's `renderForecast`, `renderCompare` and `renderSOCHistory` show with no Solcast
-forecast and no `SUNGROWD_PROMETHEUS_URL`. -/
-def renderForecast    : String := "<div id=\"forecast\"><p class=\"empty\">no complete forecast yet</p></div>"
-def renderCompare     : String := "<div id=\"compare\"><p class=\"empty\">set SUNGROWD_PROMETHEUS_URL to see actuals</p></div>"
-def renderSOCHistory  : String := "<div id=\"soc-history\"><p class=\"empty\">set SUNGROWD_PROMETHEUS_URL to see SOC history</p></div>"
+/-- What Go's `renderForecast` shows with no Solcast forecast. -/
+def renderForecast : String := "<div id=\"forecast\"><p class=\"empty\">no complete forecast yet</p></div>"
+
+/-- Go's `clampPct`, for the SOC bar and chart. -/
+def clampPct (v : Dec) : Dec :=
+  if v.isNeg then ⟨0, 0⟩ else if (Dec.mk 100 0).lt v then ⟨100, 0⟩ else v
+
+/-- Go's `socPolyline`: a day's SOC samples (minute of day, %) on the 280 × 80 chart, or `""`
+with fewer than two points. -/
+def socPolyline (samples : Array (Nat × Dec)) (cls : String) : String :=
+  if samples.size < 2 then "" else
+  let pts := samples.toList.map fun (minute, pct) =>
+    -- x = minute / 1440 × 280, y = 80 − pct / 100 × 80
+    let y : Dec := Dec.mk 80 0 - ((clampPct pct).mulInt 80).shift 2
+    s!"{fixedFrac (minute * 280) 1440 1},{y.fixed 1}"
+  s!"<polyline points=\"{" ".intercalate pts}\" class=\"{cls}\"/>"
+
+/-- Go's `socChart`: a fixed 0–100% y-axis with quarter gridlines, x the whole day, and a
+"now" marker. -/
+def socChart (yesterday today : Array (Nat × Dec)) (nowMin : Nat) : String := Id.run do
+  let mut b := "<svg class=\"soc-chart\" viewBox=\"0 0 280 80\" preserveAspectRatio=\"none\" aria-hidden=\"true\">"
+  for pct in [25, 50, 75] do
+    let y := fixedFrac (8000 - pct * 80) 100 1
+    b := b ++ s!"<line x1=\"0\" y1=\"{y}\" x2=\"280\" y2=\"{y}\" class=\"soc-grid\"/>"
+  b := b ++ socPolyline yesterday "soc-yday" ++ socPolyline today "soc-today"
+  if nowMin ≤ 1440 then
+    let x := fixedFrac (nowMin * 280) 1440 1
+    b := b ++ s!"<line x1=\"{x}\" y1=\"0\" x2=\"{x}\" y2=\"80\" class=\"spark-now\"/>"
+  return b ++ "</svg>"
+
+#guard socPolyline #[(0, ⟨50, 0⟩), (720, ⟨1005, 1⟩)] "soc-today"
+  == "<polyline points=\"0.0,40.0 140.0,0.0\" class=\"soc-today\"/>"
+
+/-- Go's `renderSOCHistory`: yesterday's and today's SOC. -/
+def renderSOCHistory (prom : Option Prom) (log : Log) (nowUnix : Int) : IO String := do
+  let some p := prom
+    | return "<div id=\"soc-history\"><p class=\"empty\">set SUNGROWD_PROMETHEUS_URL to see SOC history</p></div>"
+  let today := brisbaneDay nowUnix
+  let curve (day : Int) (label : String) : IO (Array (Nat × Dec)) := do
+    match ← (p.socCurve day nowUnix).run with
+    | .ok c    => pure c
+    | .error e => log.warn "ui soc curve" [("day", label), ("err", e)]; pure #[]
+  let t ← curve today "today"
+  let y ← curve (today - 1) "yesterday"
+  if t.size < 2 && y.size < 2 then
+    return "<div id=\"soc-history\"><p class=\"empty\">no SOC history yet</p></div>"
+  return "<div id=\"soc-history\">" ++ socChart y t (brisbaneMinuteOfDay nowUnix) ++
+    "<div class=\"fc-legend\"><span class=\"lg lg-soc-td\"></span>today" ++
+    "<span class=\"lg lg-soc-yd\"></span>yesterday</div>" ++ "</div>"
+
+/-- A day's forecast totals, for forecast vs actual. Solcast isn't ported yet, so there are
+none. -/
+structure ForecastTotals where
+  p50       : Dec
+  expected  : Dec
+  uncertain : Bool
+
+/-- Go's `%.0f%%` of `a / b × 100`, for positive `b`. -/
+def percentOf (a b : Dec) : String :=
+  fixedFrac (a.m * 10 ^ b.e * 100) (b.m * 10 ^ a.e).toNat 0 ++ "%"
+
+#guard percentOf ⟨123, 1⟩ ⟨200, 1⟩ == "62%"
+
+/-- Go's `renderCompare`: the last five days' forecast against actual generation. -/
+def renderCompare (prom : Option Prom) (corrected : Bool) (nowUnix : Int)
+    (forecast : Int → IO (Option ForecastTotals) := fun _ => pure none) : IO String := do
+  let some p := prom
+    | return "<div id=\"compare\"><p class=\"empty\">set SUNGROWD_PROMETHEUS_URL to see actuals</p></div>"
+  let mut b := "<div id=\"compare\">"
+  -- With the correction on, the ratio is judged against the corrected expectation.
+  b := b ++ if corrected then
+      "<table class=\"cmp\"><thead><tr>" ++
+      "<th>Day</th><th>P50</th><th>Expected</th><th>Actual</th><th>Act/Exp</th></tr></thead><tbody>"
+    else
+      "<table class=\"cmp\"><thead><tr>" ++
+      "<th>Day</th><th>Forecast</th><th>Actual</th><th>Act/Fcst</th></tr></thead><tbody>"
+  let today := brisbaneDay nowUnix
+  for i in [1:6] do
+    let day := today - i
+    let fc ← forecast day
+    let fcStr := (fc.map (·.p50.fixed 1)).getD "—"
+    let exStr := (fc.map (·.expected.fixed 1)).getD "—"
+    let denom : Dec := (fc.map fun f => if corrected then f.expected else f.p50).getD ⟨0, 0⟩
+    let (acStr, ratio) ← match ← (p.actualPVForDay day).run with
+      | .ok (some ac) => pure (ac.fixed 1, if (Dec.mk 0 0).lt denom then percentOf ac denom else "")
+      | _             => pure ("—", "")
+    let label := dayLabel day ++
+      if corrected && (fc.map (·.uncertain)).getD false then
+        " <span class=\"fc-badge\" title=\"Solcast P10 was well below P50: cloud risk\">☁</span>"
+      else ""
+    b := b ++ if corrected then
+        s!"<tr><td>{label}</td><td>{fcStr}</td><td>{exStr}</td><td class=\"cmp-act\">{acStr}</td><td class=\"cmp-ratio\">{ratio}</td></tr>"
+      else
+        s!"<tr><td>{label}</td><td>{fcStr}</td><td class=\"cmp-act\">{acStr}</td><td class=\"cmp-ratio\">{ratio}</td></tr>"
+  return b ++ "</tbody></table></div>"
 
 /-- Go's `resultBox`. -/
 def resultBox (id kind msg : String) : String :=
@@ -400,11 +393,13 @@ def Api.uiUpdates (api : Api) : ContextAsync (Response Body.Any) :=
       patch (renderMode i s.controller.targetReached)
     let renderSlow : Async Unit := do
       patch renderForecast
-      patch renderSOCHistory
+      patch (← renderSOCHistory api.prom api.log (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
       let ops ← try .ok <$> store.recentControlWrites 20 catch e => pure (.error (toString e))
       if let .error e := ops then api.log.warn "ui control writes" [("err", e)]
       patch (renderControlWrites ops)
       patch (renderDiag (diagJson (← api.shared.get) (← load)))
+    let compare : Async Unit := do
+      patch (← renderCompare api.prom api.corrected (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
     let clock : Async Unit := do
       patch (renderClock (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
 
@@ -413,7 +408,7 @@ def Api.uiUpdates (api : Api) : ContextAsync (Response Body.Any) :=
       sse.send (patchSignals (scheduleSeed i.window).compress (onlyIfMissing := true))
 
     -- Initial paint.
-    renderData; renderSlow; patch renderCompare; clock; tick
+    renderData; renderSlow; compare; clock; tick
 
     let mut n : Nat := 0
     repeat
@@ -425,7 +420,7 @@ def Api.uiUpdates (api : Api) : ContextAsync (Response Body.Any) :=
       renderData
       if n % 2 == 0 then clock; tick
       if n % 20 == 0 then renderSlow
-      if n % 120 == 0 then patch renderCompare
+      if n % 120 == 0 then compare
 
 /-- An action: read the signals (Go logs a bad body and carries on with none), work out the
 fragments to patch, and send them. -/

@@ -238,9 +238,20 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     d.shared.modify fun s => { s with readErrors := s.readErrors + 1, lastReadErr := some (toString e) }
     log.warn "initial inverter read failed; starting degraded" [("err", toString e)]
 
+  -- Optional extras for the UI and `/actual`: a Prometheus to read actuals from, and whether Go's
+  -- forecast correction is on (`SUNGROWD_FORECAST_SCALE`, default 0.62; 0 turns it off).
+  let prom ← Prom.ofEnv log
+  let corrected ← match ← IO.getEnv "SUNGROWD_FORECAST_SCALE" with
+    | none   => pure true
+    | some s => match Dec.ofJson? (.str s) with
+      | some v => pure (Dec.lt ⟨0, 0⟩ v)
+      | none   =>
+        log.warn "invalid float env var; using default"
+          [("key", "SUNGROWD_FORECAST_SCALE"), ("value", s), ("default", "0.62")]
+        pure true
+  let api : Api := { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake, prom, corrected }
   let serve : Async Http.Server := do
-    Http.Server.serve (← resolve lh lp)
-      (Api.handler { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake })
+    Http.Server.serve (← resolve lh lp) api.handler
   let server ← try serve.block catch e => do
     IO.eprintln s!"error: listening on {listen}: {e}"
     return 2

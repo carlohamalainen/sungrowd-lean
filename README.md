@@ -107,11 +107,20 @@ curl localhost:9180/diag
 
 A bad body is a 400 and changes nothing.
 
+With `SUNGROWD_PROMETHEUS_URL` set (the Prometheus that scrapes `/metrics`), the UI shows SOC history
+and forecast vs actual, and `/actual` serves daily PV generation:
+
+```
+curl localhost:9180/actual              # the last 7 complete days, newest first
+curl 'localhost:9180/actual?days=30'
+curl 'localhost:9180/actual?date=2026-11-23'
+```
+
 The web UI is at <http://localhost:9180/>: the Go daemon's page, verbatim (`ui/index.html`, with
 its vendored Datastar bundle `ui/datastar.js`), driven by the
 [Datastar Lean SDK](https://github.com/starfederation/datastar-lean) (`Sungrowd/Ui.lean`). The PV
-forecast, forecast-vs-actual and SOC-history panels need Solcast and Prometheus, which aren't
-ported yet, so they show what Go shows without them.
+forecast needs Solcast, which isn't ported yet, so that panel and the forecast columns show what Go
+shows without a forecast.
 
 SIGINT or SIGTERM stops the daemon after the tick in progress (so a write is never cut off before
 its read-back). Like Go's daemon, it leaves the inverter as it is.
@@ -123,7 +132,8 @@ Go daemon can't use the database afterwards.
 Settings, with Go's defaults: `SUNGROWD_DB` (`sungrowd.db`), `SUNGROWD_SCHEDULE`
 (`schedule.json`), `SUNGROWD_LISTEN` (`0.0.0.0:9180`), `SUNGROWD_STALE_THRESHOLD_SECONDS` (120),
 `SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`, `error`), `SUNGROWD_GRID_FUSE_A` (20),
-`SUNGROWD_NTFY_TOPIC` (unset: no notifications), `SUNGROWD_NTFY_SERVER` (`https://ntfy.sh`).
+`SUNGROWD_NTFY_TOPIC` (unset: no notifications), `SUNGROWD_NTFY_SERVER` (`https://ntfy.sh`),
+`SUNGROWD_PROMETHEUS_URL` (unset: no actuals), `SUNGROWD_FORECAST_SCALE` (0.62; 0 is off).
 
 With `SUNGROWD_NTFY_TOPIC` set, the daemon pushes an ntfy notification when the inverter data goes
 stale (no good read for `SUNGROWD_STALE_THRESHOLD_SECONDS`, checked every 15 s) and again when it
