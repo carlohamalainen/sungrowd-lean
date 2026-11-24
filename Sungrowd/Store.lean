@@ -123,4 +123,10 @@ def Store.insertControlWrite (s : Store) (op : WriteOp) : IO Int64 := do
     VALUES ({recordedAt}, {noOp}, {ok}, {err}, {json})"
   s.db.lastInsertRowId
 
+/-- Go's `GetControlWrites`: the latest `limit` write attempts, newest first, as their `op_json`. -/
+def Store.recentControlWrites (s : Store) (limit : Nat) : IO (Array Lean.Json) := do
+  let n : Int64 := limit.toInt64
+  let rows ← (← s.db query!"SELECT op_json FROM control_write ORDER BY id DESC LIMIT {n}" as String).toList
+  rows.toArray.mapM fun r => IO.ofExcept (Lean.Json.parse r)
+
 end Sungrowd

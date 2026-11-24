@@ -4,6 +4,7 @@ import Sungrowd.Intent
 import Sungrowd.Inverter
 import Sungrowd.Daemon
 import Sungrowd.Http
+import Sungrowd.Ui
 import Std.Data.HashMap
 import Std.Http
 

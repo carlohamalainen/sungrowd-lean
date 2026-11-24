@@ -189,9 +189,6 @@ def Api.respond (api : Api) (req : Http.Request Http.Body.Stream) : Reply := do
       | .ok w    => api.persist "charge window" ({ · with window := w }) (toJson (w.map scheduleJson))
   | _ => plain .notFound "404 page not found"
 
-def Api.handler (api : Api) : Http.Server.StatelessHandler where
-  onRequest req := do return ← api.respond req
-
 /-! ## Examples -/
 
 -- Before any read: only the error counter.

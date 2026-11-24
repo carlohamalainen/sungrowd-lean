@@ -22,3 +22,8 @@ root = "Tests"
 name = "leansqlite"
 git = "https://github.com/leanprover/leansqlite"
 rev = "v4.36.0"
+
+[[require]]
+name = "datastar"
+git = "https://github.com/starfederation/datastar-lean"
+rev = "v1.1.0"

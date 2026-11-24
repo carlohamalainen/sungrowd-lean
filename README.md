@@ -107,6 +107,12 @@ curl localhost:9180/diag
 
 A bad body is a 400 and changes nothing.
 
+The web UI is at <http://localhost:9180/>: the Go daemon's page, verbatim (`ui/index.html`, with
+its vendored Datastar bundle `ui/datastar.js`), driven by the
+[Datastar Lean SDK](https://github.com/starfederation/datastar-lean) (`Sungrowd/Ui.lean`). The PV
+forecast, forecast-vs-actual and SOC-history panels need Solcast and Prometheus, which aren't
+ported yet, so they show what Go shows without them.
+
 SIGINT or SIGTERM stops the daemon after the tick in progress (so a write is never cut off before
 its read-back). Like Go's daemon, it leaves the inverter as it is.
 
