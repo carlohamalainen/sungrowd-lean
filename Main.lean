@@ -238,18 +238,32 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     d.shared.modify fun s => { s with readErrors := s.readErrors + 1, lastReadErr := some (toString e) }
     log.warn "initial inverter read failed; starting degraded" [("err", toString e)]
 
-  -- Optional extras for the UI and `/actual`: a Prometheus to read actuals from, and whether Go's
-  -- forecast correction is on (`SUNGROWD_FORECAST_SCALE`, default 0.62; 0 turns it off).
+  -- Optional extras: a Prometheus to read actuals from, Solcast credentials for `POST /solcast`,
+  -- and Go's forecast correction (`SUNGROWD_FORECAST_SCALE`, 0 turns it off).
   let prom ← Prom.ofEnv log
-  let corrected ← match ← IO.getEnv "SUNGROWD_FORECAST_SCALE" with
-    | none   => pure true
-    | some s => match Dec.ofJson? (.str s) with
-      | some v => pure (Dec.lt ⟨0, 0⟩ v)
-      | none   =>
-        log.warn "invalid float env var; using default"
-          [("key", "SUNGROWD_FORECAST_SCALE"), ("value", s), ("default", "0.62")]
-        pure true
-  let api : Api := { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake, prom, corrected }
+  let envFloatOr (key : String) (default : Float) : IO Float := do
+    let some v ← IO.getEnv key | return default
+    if v.isEmpty then return default
+    match Lean.Json.parse v with
+    | .ok (.num n) => return n.toFloat
+    | _ =>
+      log.warn "invalid float env var; using default"
+        [("key", key), ("value", v), ("default", (Dec.ofFloat default).short)]
+      return default
+  let dflt : Correction := {}
+  let correction : Correction := {
+    scale          := ← envFloatOr "SUNGROWD_FORECAST_SCALE" dflt.scale
+    uncertainRatio := ← envFloatOr "SUNGROWD_FORECAST_UNCERTAIN_RATIO" dflt.uncertainRatio }
+  if correction.enabled then
+    log.info "forecast correction enabled"
+      [("scale", (Dec.ofFloat correction.scale).short), ("uncertain_ratio", (Dec.ofFloat correction.uncertainRatio).short)]
+  let solcast ← match ← IO.getEnv solcastResourceEnvVar, ← IO.getEnv solcastKeyEnvVar with
+    | some id, some key => if id.isEmpty || key.isEmpty then pure none else pure (some (id, key))
+    | _, _ => pure none
+  if solcast.isNone then
+    log.info s!"solcast disabled ({solcastKeyEnvVar} and {solcastResourceEnvVar} not set)"
+  let api : Api := { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake, prom,
+                     correction, solcast }
   let serve : Async Http.Server := do
     Http.Server.serve (← resolve lh lp) api.handler
   let server ← try serve.block catch e => do

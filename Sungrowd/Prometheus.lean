@@ -1,5 +1,6 @@
 import Sungrowd.Format
 import Sungrowd.Log
+import Sungrowd.HttpClient
 
 /-! # Actual generation and SOC history, from Prometheus: Go's `promquery` and the server's
 `Actual…` queries
@@ -9,7 +10,7 @@ Optional: with `SUNGROWD_PROMETHEUS_URL` set (the Prometheus that scrapes this d
 generation.
 
 The client is read only, two calls of the HTTP API (`/api/v1/query` and `/api/v1/query_range`),
-run with `curl`, which URL-encodes the parameters. Values stay exact decimals: Prometheus sends
+with `httpRequest` (`Sungrowd/HttpClient.lean`). Values stay exact decimals: Prometheus sends
 them as strings like `"54.3"` or `"1.2345e+03"`. -/
 
 namespace Sungrowd
@@ -21,6 +22,7 @@ def prometheusEnvVar : String := "SUNGROWD_PROMETHEUS_URL"
 /-- Go's metric names for the actuals. -/
 def pvTotalMetric : String := "solar_pv_kwh_total"  -- lifetime cumulative kWh (counter)
 def socMetric     : String := "solar_battery_soc_percent"
+def pvPowerMetric : String := "solar_pv_power_watts"  -- instantaneous PV power
 
 structure Prom where
   /-- e.g. `http://localhost:9090`, without a trailing slash. -/
@@ -33,24 +35,12 @@ def Prom.ofEnv (log : Log) : IO (Option Prom) := do
   log.info "prometheus configured for actuals" [("url", u)]
   return some ⟨String.ofList (u.toList.reverse.dropWhile (· == '/')).reverse⟩
 
-/-- Go's `snippet`: the first 200 characters of an error body. -/
-private def snippet (s : String) : String := String.ofList (s.toList.take 200)
-
 /-- Go's `get`: the `data.result` of a successful API call. A 10 s timeout, as Go's client. -/
 def Prom.get (p : Prom) (path : String) (params : List (String × String)) :
     ExceptT String IO Json := do
-  let encoded := params.foldl (fun acc (k, v) => acc ++ #["--data-urlencode", s!"{k}={v}"]) #[]
-  let out ← (IO.Process.output {
-      cmd := "curl",
-      args := #["-sS", "--max-time", "10", "-G", "-w", "\n%{http_code}"] ++ encoded ++ #[p.base ++ path] }
-    : IO _)
-  if out.exitCode != 0 then throw out.stderr.trimAscii.toString  -- curl says "curl: (7) …"
-  -- The body, then the status on its own line.
-  let lines := out.stdout.splitOn "\n"
-  let status := lines.getLast?.getD ""
-  let body := "\n".intercalate lines.dropLast
-  if status != "200" then throw s!"prometheus HTTP {status}: {snippet body}"
-  let resp ← match Json.parse body with
+  let r ← ExceptT.mk (httpRequest "GET" (p.base ++ path) (query := params))
+  if r.status != 200 then throw s!"prometheus HTTP {r.status}: {snippet r.body}"
+  let resp ← match Json.parse r.body with
     | .ok j    => pure j
     | .error e => throw s!"decode prometheus response: {e}"
   if resp.getObjValD "status" != .str "success" then
@@ -107,5 +97,15 @@ def Prom.socCurve (p : Prom) (day nowUnix : Int) : ExceptT String IO (Array (Nat
   if stop ≤ start then return #[]
   let pts ← p.range socMetric start stop 600
   return pts.map fun (t, v) => ((t - start).toNat / 60, v)
+
+/-- Go's `ActualPVTodaySoFar`: kWh generated since local midnight. -/
+def Prom.pvTodaySoFar (p : Prom) (nowUnix : Int) : ExceptT String IO (Option Dec) :=
+  p.pvDelta (brisbaneMidnight (brisbaneDay nowUnix)) nowUnix
+
+/-- Go's `ActualPVTodayCurve`: PV power (kW) every half hour from local midnight to now, by
+minute of the day, to overlay on the forecast. -/
+def Prom.pvTodayCurve (p : Prom) (nowUnix : Int) : ExceptT String IO (Array (Nat × Dec)) := do
+  let pts ← p.range pvPowerMetric (brisbaneMidnight (brisbaneDay nowUnix)) nowUnix 1800
+  return pts.map fun (t, w) => (brisbaneMinuteOfDay t, w.shift 3)
 
 end Sungrowd

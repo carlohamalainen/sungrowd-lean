@@ -1,12 +1,12 @@
 import Sungrowd.Daemon
+import Sungrowd.HttpClient
 
 /-! # Push notifications when the inverter data goes stale: Go's `notify` package
 
 The `Watcher` is a pure state machine over "when was the last good read", so it is tested with
 Go's own cases and proved to alternate: never two "stale" alerts without a "recovered" between.
 
-Publishing is an ntfy POST. `Std` has no HTTP client (or TLS) yet, so it runs `curl`, with
-arguments passed directly (no shell) and the body on stdin. -/
+Publishing is an ntfy POST, with `httpRequest` (`Sungrowd/HttpClient.lean`). -/
 
 namespace Sungrowd
 
@@ -108,31 +108,14 @@ def Ntfy.ofEnv : IO (Option Ntfy) := do
 /-- Go's `Publish`: POST `body` to the topic with ntfy's headers, a 10 s timeout, and log the
 outcome. Never throws. -/
 def Ntfy.publish (n : Ntfy) (log : Log) (title priority tags body : String) : IO Unit := do
-  try
-    let child ← IO.Process.spawn {
-      cmd := "curl"
-      args := #["-sS", "--max-time", "10", "-X", "POST",
-                "-H", s!"Title: {title}", "-H", s!"Priority: {priority}", "-H", s!"Tags: {tags}",
-                "--data-binary", "@-", "-o", "/dev/null", "-w", "%{http_code}",
-                s!"{n.server}/{n.topic}"]
-      stdin := .piped, stdout := .piped, stderr := .piped }
-    let (stdin, child) ← child.takeStdin
-    stdin.putStr body
-    stdin.flush
-    -- `stdin` is closed after its last use, so curl sees the end of the body.
-    let out ← child.stdout.readToEnd
-    let err ← child.stderr.readToEnd
-    let code ← child.wait
-    if code != 0 then
-      log.error "ntfy: publish failed" [("title", title), ("err", err.trimAscii.toString)]
-      return
-    let status := out.trimAscii.toString.toNat?.getD 0
-    if status < 200 || status ≥ 300 then
-      log.error "ntfy: publish rejected" [("title", title), ("status", toString status)]
-      return
-    log.info "ntfy: published" [("title", title), ("priority", priority)]
-  catch e =>
-    log.error "ntfy: publish failed" [("title", title), ("err", toString e)]
+  match ← httpRequest "POST" s!"{n.server}/{n.topic}" (body := some body)
+      (headers := [("Title", title), ("Priority", priority), ("Tags", tags)]) with
+  | .error e => log.error "ntfy: publish failed" [("title", title), ("err", e)]
+  | .ok r =>
+    if r.status < 200 || r.status ≥ 300 then
+      log.error "ntfy: publish rejected" [("title", title), ("status", toString r.status)]
+    else
+      log.info "ntfy: published" [("title", title), ("priority", priority)]
 
 /-- Go's `watchStaleness`: every 15 s, push on going stale and on recovering. Returns when
 `stop` has a message. -/

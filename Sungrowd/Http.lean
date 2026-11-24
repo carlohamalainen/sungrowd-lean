@@ -2,6 +2,7 @@ import Std.Http
 import Sungrowd.Daemon
 import Sungrowd.Store
 import Sungrowd.Prometheus
+import Sungrowd.Solcast
 
 /-! # The daemon's HTTP endpoints, as in Go: `/metrics`, `/healthz`, `/diag` and the control API -/
 
@@ -123,10 +124,37 @@ structure Api where
   wake       : Std.Channel Unit
   /-- For the actuals; none without `SUNGROWD_PROMETHEUS_URL`. -/
   prom       : Option Prom := none
-  /-- Go's forecast correction is on (`SUNGROWD_FORECAST_SCALE` > 0, the default). -/
-  corrected  : Bool := true
+  /-- Go's site correction for forecasts (`SUNGROWD_FORECAST_SCALE`, `…_UNCERTAIN_RATIO`). -/
+  correction : Correction := {}
+  /-- Solcast's resource id and API key; none without `SOLCAST_RESOURCE_ID` and `SOLCAST_API_KEY`. -/
+  solcast    : Option (String × String) := none
 
 def maxBodyBytes : UInt64 := 65536
+
+/-- A query parameter, decoded. -/
+def queryParam (req : Http.Request Http.Body.Stream) (k : String) : Option String := do
+  let some v := req.line.uri.query.find? k | none
+  let v ← v
+  v.decode
+
+/-- Go's `forecastHandler`: today and tomorrow, or `?date=YYYY-MM-DD`; a day without a complete
+forecast is left out. -/
+def forecastJson (dbPath : System.FilePath) (correction : Correction) (log : Log)
+    (date : Option String) (nowUnix : Int) : IO (Except (Http.Status × String) Json) := do
+  let days ← match date with
+    | some d => match parseDate? d with
+      | some day => pure [day]
+      | none     => return .error (.badRequest, "invalid date, want YYYY-MM-DD")
+    | none => pure [brisbaneDay nowUnix, brisbaneDay nowUnix + 1]
+  let mut out := #[]
+  for day in days do
+    try
+      if let some d ← (← Store.open dbPath).forecastForDay day then
+        out := out.push (toJson (correction.apply d))
+    catch e =>
+      log.error "forecast query" [("date", dateString day), ("err", toString e)]
+      return .error (.internalServerError, toString e)
+  return .ok (Json.mkObj [("days", .arr out)])
 
 /-- Go's `actualHandler`: `?date=YYYY-MM-DD`, or the last `?days=N` complete days (default 7, at
 most 90), newest first; `null` kWh for a day without data. -/
@@ -208,14 +236,30 @@ def Api.respond (api : Api) (req : Http.Request Http.Body.Stream) : Reply := do
     match api.prom with
     | none => plain .serviceUnavailable "actuals unavailable: SUNGROWD_PROMETHEUS_URL not set"
     | some p =>
-      let param (k : String) : Option String := do
-        let some v := req.line.uri.query.find? k | none
-        let v ← v
-        v.decode
       let nowUnix := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
-      match ← actualJson p api.log (param "date") (param "days") nowUnix with
+      match ← actualJson p api.log (queryParam req "date") (queryParam req "days") nowUnix with
       | .ok j              => Http.Response.ok.json j.pretty
       | .error (status, e) => plain status e
+  | "/forecast" =>
+    if method != .get then notAllowed else
+    let nowUnix := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
+    match ← forecastJson api.dbPath api.correction api.log (queryParam req "date") nowUnix with
+    | .ok j              => Http.Response.ok.json j.pretty
+    | .error (status, e) => plain status e
+  | "/solcast" =>
+    if method != .post then notAllowed else
+    match api.solcast with
+    | none => plain .serviceUnavailable "solcast unavailable: SOLCAST_API_KEY and SOLCAST_RESOURCE_ID not set"
+    | some (resourceId, apiKey) =>
+      let r ← try (← Store.open api.dbPath).fetchSolcast api.log resourceId apiKey
+        catch e => pure (.error (toString e))
+      match r with
+      | .error e =>
+        api.log.error "solcast fetch" [("err", e)]
+        plain .badGateway e
+      | .ok id =>
+        api.log.info "solcast fetch stored" [("forecast_id", toString id)]
+        (Http.Response.withStatus .created).json (Json.mkObj [("forecast_id", toJson id.toInt)]).compress
   | "/control/override" =>
     if method != .post then notAllowed else
     withBody req.body fun j => do

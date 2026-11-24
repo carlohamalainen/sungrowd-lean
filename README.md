@@ -118,9 +118,17 @@ curl 'localhost:9180/actual?date=2026-11-23'
 
 The web UI is at <http://localhost:9180/>: the Go daemon's page, verbatim (`ui/index.html`, with
 its vendored Datastar bundle `ui/datastar.js`), driven by the
-[Datastar Lean SDK](https://github.com/starfederation/datastar-lean) (`Sungrowd/Ui.lean`). The PV
-forecast needs Solcast, which isn't ported yet, so that panel and the forecast columns show what Go
-shows without a forecast.
+[Datastar Lean SDK](https://github.com/starfederation/datastar-lean) (`Sungrowd/Ui.lean`).
+
+Solcast forecasts, as in Go: `POST /solcast` downloads the rooftop site's forecast and stores it
+(Go's deployment calls it from a systemd timer), and `/forecast` serves the freshest download that
+covers each whole day, with the site correction applied:
+
+```
+curl -X POST localhost:9180/solcast    # {"forecast_id": 77}; uses one of Solcast's daily API calls
+curl localhost:9180/forecast           # today and tomorrow
+curl 'localhost:9180/forecast?date=2026-11-25'
+```
 
 SIGINT or SIGTERM stops the daemon after the tick in progress (so a write is never cut off before
 its read-back). Like Go's daemon, it leaves the inverter as it is.
@@ -133,12 +141,17 @@ Settings, with Go's defaults: `SUNGROWD_DB` (`sungrowd.db`), `SUNGROWD_SCHEDULE`
 (`schedule.json`), `SUNGROWD_LISTEN` (`0.0.0.0:9180`), `SUNGROWD_STALE_THRESHOLD_SECONDS` (120),
 `SUNGROWD_LOG_LEVEL` (`info`; or `debug`, `warn`, `error`), `SUNGROWD_GRID_FUSE_A` (20),
 `SUNGROWD_NTFY_TOPIC` (unset: no notifications), `SUNGROWD_NTFY_SERVER` (`https://ntfy.sh`),
-`SUNGROWD_PROMETHEUS_URL` (unset: no actuals), `SUNGROWD_FORECAST_SCALE` (0.62; 0 is off).
+`SUNGROWD_PROMETHEUS_URL` (unset: no actuals), `SOLCAST_API_KEY` and `SOLCAST_RESOURCE_ID` (unset:
+`/solcast` is a 503), `SUNGROWD_FORECAST_SCALE` (0.62; 0 is off), `SUNGROWD_FORECAST_UNCERTAIN_RATIO`
+(0.5).
 
 With `SUNGROWD_NTFY_TOPIC` set, the daemon pushes an ntfy notification when the inverter data goes
 stale (no good read for `SUNGROWD_STALE_THRESHOLD_SECONDS`, checked every 15 s) and again when it
-recovers, as Go does. It posts with `curl`, which must be on the `PATH`: Lean's standard library
-has no HTTP client yet.
+recovers, as Go does.
+
+ntfy, Prometheus and Solcast are reached with `curl`, which must be on the `PATH`: Lean's standard
+library has no HTTP client yet. `Sungrowd/HttpClient.lean` is the one place that runs it, and
+gives it each request on stdin, so the Solcast API key never appears in `ps`.
 
 ## Tests
 

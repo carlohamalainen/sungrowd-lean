@@ -11,9 +11,9 @@ are Go's, character for character: the same elements, classes and format strings
 Everything goes through the Datastar SDK: `sseResponse` for the streams, `patchElements` and
 `patchSignals` for the events, `readSignals` for what the page sends.
 
-SOC history and forecast vs actual come from Prometheus (`Sungrowd/Prometheus.lean`), when
-`SUNGROWD_PROMETHEUS_URL` is set. Not ported yet: Solcast, so the forecast panel and the forecast
-columns show what Go shows without a forecast. -/
+The PV forecast comes from the stored Solcast downloads (`Sungrowd/Solcast.lean`); SOC history,
+forecast vs actual and today's actual generation from Prometheus (`Sungrowd/Prometheus.lean`),
+when `SUNGROWD_PROMETHEUS_URL` is set. -/
 
 namespace Sungrowd
 
@@ -204,8 +204,6 @@ def renderDiag (j : Json) : String :=
 def renderClock (unix : Int) : String :=
   s!"<span id=\"clock\">{brisbaneClock unix (seconds := true)} AEST</span>"
 
-/-- What Go's `renderForecast` shows with no Solcast forecast. -/
-def renderForecast : String := "<div id=\"forecast\"><p class=\"empty\">no complete forecast yet</p></div>"
 
 /-- Go's `clampPct`, for the SOC bar and chart. -/
 def clampPct (v : Dec) : Dec :=
@@ -300,6 +298,119 @@ def renderCompare (prom : Option Prom) (corrected : Bool) (nowUnix : Int)
         s!"<tr><td>{label}</td><td>{fcStr}</td><td class=\"cmp-act\">{acStr}</td><td class=\"cmp-ratio\">{ratio}</td></tr>"
   return b ++ "</tbody></table></div>"
 
+/-! ### The forecast panel -/
+
+/-- Go's `%.{places}f` of a float. -/
+def ffix (x : Float) (places : Nat) : String := (Dec.ofFloat x).fixed places
+
+def Dec.toFloat (a : Dec) : Float := a.m.toFloat / (10 ^ a.e).toFloat
+
+/-- Go's `hhmmToMin`: `"HH:MM"` in minutes, or none. -/
+def hhmmToMin (s : String) : Option Nat := (TimeOfDay.parse? s).map (·.minuteOfDay)
+
+/-- Go's `sparkline`: a day's P50 curve on the 280 × 40 chart, scaled to `peakMax`, with today's
+actual generation (by minute of the day, kW) and a "now" marker at `nowMin` if given. -/
+def sparkline (d : DayForecast) (peakMax : Float) (nowMin : Option Nat)
+    (actual : Array (Nat × Dec)) : String :=
+  let (w, h) : Float × Float := (280, 40)
+  let n := d.periods.size
+  if n < 2 then "" else
+  let last := (n - 1).toFloat
+  let yOf (kw : Float) : Float := let y := h - (kw / peakMax) * h; if y < 0 then 0 else y
+  let pts := d.periods.toList.zipIdx.map fun (p, i) =>
+    s!"{ffix (i.toFloat / last * w) 1},{ffix (yOf p.p50) 1}"
+  let line := " ".intercalate pts
+  let area := s!"0,{ffix h 1} {line} {ffix w 1},{ffix h 1}"
+  -- Actual generation so far, on the same x-axis: half-hour steps from the first slot.
+  let actualLine :=
+    if actual.size < 2 then "" else
+    let ap := actual.toList.map fun (minute, kw) =>
+      let idx := minute.toFloat / 30
+      let idx := if idx > last then last else idx
+      s!"{ffix (idx / last * w) 1},{ffix (yOf kw.toFloat) 1}"
+    s!"<polyline points=\"{" ".intercalate ap}\" class=\"spark-actual\"/>"
+  let marker := match nowMin, d.periods[0]? >>= (hhmmToMin ·.time) with
+    | some now, some start0 =>
+      let idx := (now.toFloat - start0.toFloat) / 30
+      if idx ≥ 0 && idx ≤ last then
+        let x := ffix (idx / last * w) 1
+        s!"<line x1=\"{x}\" y1=\"0\" x2=\"{x}\" y2=\"40\" class=\"spark-now\"/>"
+      else ""
+    | _, _ => ""
+  "<svg class=\"spark\" viewBox=\"0 0 280 40\" preserveAspectRatio=\"none\" aria-hidden=\"true\">" ++
+  s!"<polygon points=\"{area}\" class=\"spark-area\"/><polyline points=\"{line}\" class=\"spark-line\"/>{actualLine}{marker}</svg>"
+
+#guard sparkline { date := "", periods := #[⟨"06:00", 0, 0, 0⟩, ⟨"06:30", 0, 1, 0⟩, ⟨"07:00", 0, 2, 0⟩] }
+    2 (some (6 * 60 + 30)) #[]
+  == "<svg class=\"spark\" viewBox=\"0 0 280 40\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polygon points=\"0,40.0 0.0,40.0 140.0,20.0 280.0,0.0 280.0,40.0\" class=\"spark-area\"/><polyline points=\"0.0,40.0 140.0,20.0 280.0,0.0\" class=\"spark-line\"/><line x1=\"140.0\" y1=\"0\" x2=\"140.0\" y2=\"40\" class=\"spark-now\"/></svg>"
+
+/-- Go's `PVForecastForDay`: the stored day, corrected. -/
+def forecastFor (store : Store) (correction : Correction) (day : Int) : IO (Option DayForecast) := do
+  return (← store.forecastForDay day).map correction.apply
+
+/-- Go's `renderForecast`: today and tomorrow, each day's kWh, peak and P50 curve, on a shared
+y-scale; today with its actual generation so far, when Prometheus is configured. -/
+def renderForecast (store : Store) (prom : Option Prom) (correction : Correction) (log : Log)
+    (nowUnix : Int) : IO String := do
+  let today := brisbaneDay nowUnix
+  let reqs := [("Today", today), ("Tomorrow", today + 1)]
+  let mut days := #[]
+  let mut peakMax : Float := 0
+  for (_, day) in reqs do
+    let d ← try forecastFor store correction day catch e => do
+      log.warn "ui forecast" [("date", dateString day), ("err", toString e)]; pure none
+    if let some d := d then if d.peakKWP50 > peakMax then peakMax := d.peakKWP50
+    days := days.push d
+  let mut todayCurve := #[]
+  let mut todayActual : Option Dec := none
+  if let some p := prom then
+    match ← (p.pvTodayCurve nowUnix).run with
+    | .ok c    => todayCurve := c
+    | .error e => log.warn "ui actual curve" [("err", e)]
+    match ← (p.pvTodaySoFar nowUnix).run with
+    | .ok a    => todayActual := a
+    | .error e => log.warn "ui actual so-far" [("err", e)]
+  for (_, kw) in todayCurve do
+    if kw.toFloat > peakMax then peakMax := kw.toFloat
+  if peakMax ≤ 0 then peakMax := 1  -- flat sparklines
+  let corrected := correction.enabled
+  let mut b := "<div id=\"forecast\">"
+  let mut any := false
+  for ((label, _), i) in reqs.zipIdx do
+    let some d := days[i]! | continue
+    any := true
+    let isToday := i == 0
+    -- The headline is the site-corrected expectation when the correction is on.
+    let headline := if corrected then d.expectedKWh else d.totalKWhP50
+    b := b ++ "<div class=\"fc-day\"><div class=\"fc-head\">" ++ s!"<span class=\"fc-label\">{label}"
+    if corrected && d.uncertain then
+      b := b ++ " <span class=\"fc-badge\" title=\"Solcast P10 is well below P50: cloud risk, the scaled estimate has historically overestimated most on such days\">cloud risk</span>"
+    b := b ++ "</span>"
+    match isToday, todayActual with
+    | true, some a =>
+      b := b ++ s!"<span class=\"fc-kwh\"><span class=\"fc-actual\">{a.fixed 1}</span> / {ffix headline 1}<span class=\"m-unit\">kWh</span></span>"
+    | _, _ =>
+      b := b ++ s!"<span class=\"fc-kwh\">{ffix headline 1}<span class=\"m-unit\">kWh</span></span>"
+    b := b ++ "</div>"
+    if isToday then
+      b := b ++ sparkline d peakMax (some (brisbaneMinuteOfDay nowUnix)) todayCurve
+      if todayCurve.size ≥ 2 then
+        b := b ++ "<div class=\"fc-legend\"><span class=\"lg lg-fc\"></span>forecast" ++
+          "<span class=\"lg lg-ac\"></span>actual</div>"
+    else
+      b := b ++ sparkline d peakMax none #[]
+    b := b ++ if corrected then
+        s!"<div class=\"fc-sub\">p50 {ffix d.totalKWhP50 1} × {ffix d.scale 2} · p10 {ffix d.totalKWhP10 1} · peak {ffix d.peakKWP50 2} kW · {htmlEscape d.date}</div></div>"
+      else
+        s!"<div class=\"fc-sub\">peak {ffix d.peakKWP50 2} kW · {htmlEscape d.date}</div></div>"
+  if !any then b := b ++ "<p class=\"empty\">no complete forecast yet</p>"
+  return b ++ "</div>"
+
+/-- The forecast-vs-actual table's forecast for a day. -/
+def forecastTotals (store : Store) (correction : Correction) (day : Int) : IO (Option ForecastTotals) := do
+  let d ← try forecastFor store correction day catch _ => pure none
+  return d.map fun d => ⟨Dec.ofFloat d.totalKWhP50, Dec.ofFloat d.expectedKWh, d.uncertain⟩
+
 /-- Go's `resultBox`. -/
 def resultBox (id kind msg : String) : String :=
   if msg.isEmpty then s!"<div id=\"{id}\"></div>"
@@ -392,14 +503,15 @@ def Api.uiUpdates (api : Api) : ContextAsync (Response Body.Any) :=
       patch (renderStatus s (← IO.monoMsNow))
       patch (renderMode i s.controller.targetReached)
     let renderSlow : Async Unit := do
-      patch renderForecast
+      patch (← renderForecast store api.prom api.correction api.log (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
       patch (← renderSOCHistory api.prom api.log (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
       let ops ← try .ok <$> store.recentControlWrites 20 catch e => pure (.error (toString e))
       if let .error e := ops then api.log.warn "ui control writes" [("err", e)]
       patch (renderControlWrites ops)
       patch (renderDiag (diagJson (← api.shared.get) (← load)))
     let compare : Async Unit := do
-      patch (← renderCompare api.prom api.corrected (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
+      patch (← renderCompare api.prom api.correction.enabled (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
+        (forecastTotals store api.correction))
     let clock : Async Unit := do
       patch (renderClock (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val)
 
