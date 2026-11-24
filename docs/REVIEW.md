@@ -201,9 +201,6 @@ Check:
       (+ discharge / − charge). The policy's signs depend on these.
 - [ ] `brisbaneMinute` (`Inverter.lean:262`) assumes UTC+10 all year, which is right for
       Brisbane (no daylight saving) and is what Go does.
-- [ ] Tidy-up: `PowerFlow.lean` has an old copy of `PowerFlow.toRaw_flags` in a block comment
-      (around line 55); the live one is at line 91. `Sungrowd/Basic.lean` is a leftover
-      (`def hello := "world"`).
 
 Evidence: `Slot.sensors_*` and `ReadBlock.mem_sensors` (slots keep their sensors through
 updates), `RunningState.ofRaw?_toRaw` / `toRaw_of_ofRaw?`, `PowerFlow.toRaw_flags` (decoding

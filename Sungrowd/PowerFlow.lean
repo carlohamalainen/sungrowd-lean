@@ -52,17 +52,6 @@ def PowerFlow.unknownBits (v : UInt16) : UInt16 := v &&& ~~~PowerFlow.knownMask
 
 def PowerFlow.toRaw (fs : List PowerFlow) : UInt16 := fs.foldl (· ||| ·.bit) 0
 
-/-
-Concise version: unfold everything, case split on all 7 `if`s inside `List.filter`
-(2^7 = 128 goals, each with a concrete list of flags), and hand each to the SAT solver.
-Correct, but ~10 s to check because of the 128 `bv_decide` calls.
-
-theorem PowerFlow.toRaw_flags (v : UInt16) : toRaw (flags v) ||| unknownBits v = v := by
-  simp only [toRaw, flags, unknownBits, knownMask, all, List.filter]
-  split <;> split <;> split <;> split <;> split <;> split <;> split <;>
-    simp only [List.foldl, bit, bne_iff_ne, ne_eq, bne_eq_false_iff_eq] at * <;> bv_decide
--/
-
 /-- Filtering a list and then OR-ing the survivors' bits is the same as OR-ing in every
 element's bit conditionally. This is what lets the main proof avoid case splits: the list
 structure disappears and only bit-vector `if`s remain, which `bv_decide` handles natively. -/
