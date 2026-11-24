@@ -193,6 +193,25 @@ def Action.ofRegisters (cr : ControlRegisters) : Action :=
 theorem Action.ofRegisters_registers (a : Action) : Action.ofRegisters a.registers = a := by
   cases a <;> rfl
 
+/-- What the inverter does while its registers hold `raw`: `none` for values we don't model
+(e.g. EMS mode 3, external EMS). -/
+def Action.ofRaw? (raw : Vector UInt16 3) : Option Action :=
+  Action.ofRegisters <$> ControlRegisters.ofRaw? raw
+
+/-- The inverter, holding `raw`, already does what `cr` asks, so there is nothing to write. This
+ignores the registers the inverter ignores: "forced stop 3000 W" already holds "forced stop 0 W". -/
+def ControlRegisters.heldBy (cr : ControlRegisters) (raw : Vector UInt16 3) : Bool :=
+  Action.ofRaw? raw == some (Action.ofRegisters cr)
+
+/-- Registers we wrote and read back exactly are held. -/
+theorem ControlRegisters.heldBy_toRaw (cr : ControlRegisters) : cr.heldBy cr.toRaw := by
+  simp [heldBy, Action.ofRaw?, ControlRegisters.ofRaw?_toRaw]
+
+#guard ControlRegisters.heldBy ⟨.forced, .stop, ⟨0, rfl, by decide⟩⟩ #v[2, 204, 3000]
+#guard ControlRegisters.selfConsumption.heldBy #v[0, 170, 3000]
+#guard !ControlRegisters.heldBy ⟨.forced, .charge, ⟨500, rfl, by decide⟩⟩ #v[2, 170, 1000]
+#guard !ControlRegisters.selfConsumption.heldBy #v[3, 204, 0]
+
 instance : ToString Action where
   toString
     | .selfConsumption => "self consumption"
@@ -258,7 +277,8 @@ instance : Lean.ToJson WriteOp where
     ++ (if op.outcome matches .noOp then [("no_op", Lean.toJson true)] else [])
     ++ (op.outcome.err?.map fun e => [("err", Lean.toJson e)]).getD []
 
-/-- Read the registers, write `value` if they differ, then read back to check. -/
+/-- Read the registers, write `value` unless the inverter already does what it asks (`heldBy`),
+then read back to check that it now does. -/
 def safeWriteControl (c : Client) (value : ControlRegisters) : Std.Async.Async WriteOp := do
   let recordedAt ← Std.Time.Timestamp.now
   let op : WriteOp := { recordedAt, before := none, intended := value, after := none, outcome := .ok }
@@ -269,7 +289,7 @@ def safeWriteControl (c : Client) (value : ControlRegisters) : Std.Async.Async W
     | .ok v    => pure v
   let op := { op with before := some before }
 
-  if before == want then
+  if value.heldBy before then
     return { op with after := some before, outcome := .noOp }
 
   if let .error e ← (c.writeMultipleRegisters regEMSMode want).run then
@@ -279,6 +299,6 @@ def safeWriteControl (c : Client) (value : ControlRegisters) : Std.Async.Async W
   | .error e => return { op with outcome := .unverified e }
   | .ok after =>
     let op := { op with after := some after }
-    return if after == want then op else { op with outcome := .mismatch after }
+    return if value.heldBy after then op else { op with outcome := .mismatch after }
 
 end Sungrowd.Control

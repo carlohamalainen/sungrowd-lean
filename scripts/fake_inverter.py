@@ -3,7 +3,8 @@
 Input registers default to 0, except SOC (13022, tenths of a percent), grid power
 (13009/13010, int32 low word first) and battery power (5213/5214, same), set by
 FAKE_SOC, FAKE_GRID and FAKE_BATT. Holding registers 13049..13051 start in
-self-consumption (0, 0xCC, 0) and keep what is written.
+self-consumption (0, 0xCC, 0), or FAKE_EMS (e.g. "2,204,3000": forced stop with a
+leftover power), and keep what is written.
 
 FAKE_FAIL_EVERY=n makes every n-th request fail with modbus exception 4.
 
@@ -21,7 +22,9 @@ import sys
 
 log = logging.getLogger("fake_inverter")
 
-holding = {13049: 0, 13050: 0xCC, 13051: 0}
+holding = dict(
+    zip((13049, 13050, 13051), (int(v) for v in os.environ.get("FAKE_EMS", "0,204,0").split(",")))
+)
 requests = 0
 
 

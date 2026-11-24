@@ -144,11 +144,11 @@ def Daemon.setControl (d : Daemon) (v : Vector UInt16 3) : IO Unit := do
   d.shared.modify fun s => { s with control := some (v, now) }
 
 /-- Go's `applyControl`: converge the inverter to `desired`, skipping I/O while the cached
-registers already match and are under `controlReconcileMs` old. -/
+registers already do what it asks (`heldBy`) and are under `controlReconcileMs` old. -/
 def Daemon.applyControl (d : Daemon) (desired : ControlRegisters) (reason : String) : IO Unit := do
   let want := desired.toRaw
   if let some (v, at_) := (← d.shared.get).control then
-    if v == want && (← IO.monoMsNow) < at_ + controlReconcileMs then
+    if desired.heldBy v && (← IO.monoMsNow) < at_ + controlReconcileMs then
       d.log.debug "control registers already correct (cached)" [("reason", reason)]
       return
   let current ← match ← (d.readControl).run.block with
@@ -157,7 +157,7 @@ def Daemon.applyControl (d : Daemon) (desired : ControlRegisters) (reason : Stri
       d.log.error "apply control failed" [("reason", reason), ("err", toString e)]
       return
   d.setControl current
-  if current == want then
+  if desired.heldBy current then
     d.log.debug "control registers already correct" [("reason", reason), ("current", showRaw current)]
     return
   if !d.args.apply then
@@ -178,7 +178,7 @@ def Daemon.applyControl (d : Daemon) (desired : ControlRegisters) (reason : Stri
   catch e => d.log.error "could not record control write" [("err", toString e)]
   match op.outcome with
   | .ok | .noOp =>
-    d.setControl want
+    d.setControl (op.after.getD want)
     d.log.info "control registers changed" [("reason", reason), ("now", toString desired)]
   | .unverified e =>
     d.log.warn "control write sent but not confirmed this tick (will re-check next tick)"
@@ -251,8 +251,17 @@ def Daemon.handle (d : Daemon) (w : Worker) : IO Worker := do
   return { st, loaded := some intent, effective := some effective, lastDecision := some decision }
 
 /-- Go's worker loop: tick at once, then every `tickIntervalMs` (skipping ticks if one overruns,
-like a Go ticker), and also whenever `wake` has a message. A wake doesn't move the schedule. -/
+like a Go ticker), and also whenever `wake` has a message. A wake doesn't move the schedule.
+
+Returns on SIGINT or SIGTERM, Go's `signal.NotifyContext`. A tick in progress finishes first, so a
+write is never cut off between sending and reading back. -/
 def Daemon.loop (d : Daemon) : IO Unit := do
+  -- `wait` starts listening now. A select only starts a waiter when it checks it, so without
+  -- this a signal during the first tick would get the default action and kill the process.
+  let signals ← [("SIGINT", Signal.sigint), ("SIGTERM", .sigterm)].mapM fun (name, sig) => do
+    let waiter ← Signal.Waiter.mk sig (repeating := false)
+    discard waiter.wait
+    return (name, waiter)
   let mut w : Worker := {}
   let mut next ← IO.monoMsNow
   repeat
@@ -261,10 +270,14 @@ def Daemon.loop (d : Daemon) : IO Unit := do
       pure w
     let now ← IO.monoMsNow
     while next ≤ now do next := next + tickIntervalMs
-    let wait : Async Unit := do
-      Selectable.one #[
-        .case (← Selector.sleep (msOffset (next - now))) pure,
-        .case d.wake.recvSelector pure]
-    wait.block
+    -- Wait for the next tick, a wake, or a signal (which a one-shot waiter keeps until checked).
+    let wait : Async (Option String) := do
+      Selectable.one <|
+        #[.case (← Selector.sleep (msOffset (next - now))) fun _ => pure none,
+          .case d.wake.recvSelector fun _ => pure none]
+        ++ signals.toArray.map fun (name, waiter) => .case waiter.selector fun _ => pure (some name)
+    if let some name ← wait.block then
+      d.log.info "shutting down" [("signal", name)]
+      break
 
 end Sungrowd

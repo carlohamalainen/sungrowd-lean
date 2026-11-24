@@ -107,6 +107,9 @@ curl localhost:9180/diag
 
 A bad body is a 400 and changes nothing.
 
+SIGINT or SIGTERM stops the daemon after the tick in progress (so a write is never cut off before
+its read-back). Like Go's daemon, it leaves the inverter as it is.
+
 To move over from the Go daemon, stop it and copy its database: the Lean daemon reads Go's
 intent format and keeps its `control_write` history, but writes only its own format, so the
 Go daemon can't use the database afterwards.

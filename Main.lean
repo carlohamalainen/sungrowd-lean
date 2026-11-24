@@ -173,7 +173,7 @@ def tickMain (host : String) (port : UInt16) (debug : Bool) (args : TickArgs) : 
     match decision with
     | .leave _ => return 0
     | .apply r _ =>
-      if current == r.toRaw then
+      if r.heldBy current then
         IO.println "action    none: the inverter already holds it"
         return 0
       if !args.apply then
@@ -236,14 +236,23 @@ def runMain (host : String) (port : UInt16) (debug : Bool) (args : RunArgs) : IO
     log.warn "initial inverter read failed; starting degraded" [("err", toString e)]
 
   let serve : Async Http.Server := do
-    Http.Server.serve (← resolve lh lp) 
+    Http.Server.serve (← resolve lh lp)
       (Api.handler { shared := d.shared, thresholdS, dbPath, fuse, log, wake := d.wake })
-  let _server ← try serve.block catch e => do
+  let server ← try serve.block catch e => do
     IO.eprintln s!"error: listening on {listen}: {e}"
     return 2
   log.info "listening" [("addr", listen)]
 
   d.loop
+
+  -- Go gives open requests up to 10 s. Ours are short, and `shutdown` cancels them anyway. The
+  -- inverter is left as it is, as in Go: forced mode stays forced until something changes it.
+  let stop : Async Unit := do
+    server.shutdown
+    Selectable.one #[.case server.waitShutdownSelector pure,
+                     .case (← Selector.sleep (msOffset 10000)) pure]
+  try stop.block catch e => log.error "http shutdown" [("err", toString e)]
+  log.info "stopped"
   return 0
 
 def main (args : List String) : IO UInt32 := do
